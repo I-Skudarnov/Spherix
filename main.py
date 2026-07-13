@@ -1,727 +1,1450 @@
 #!/usr/bin/env python3
 """
-Filler_hex — гексагональный клон игры Filler (по мотивам игры Скударнова И., 1991).
-Python/pygame.
+SPHERIX — порт игры 1991 года (QBasic, автор Скударнов И.) на Python/pygame.
 
-Этап 1: игровое поле из правильных шестиугольников («pointy-top»), 28 столбцов × 16
-рядов = 448 гексов, случайная раскраска в 7 цветов; отрисовка поля, верхней строки
-со счётом и подписью, нижней палитры-маркера.
+Игра-головоломка в духе «Тетриса», но фигуры состоят из выпуклых и вогнутых
+дуг (полусфер). Падающая фигура занимает квадрат 2×2 клетки; каждая клетка
+делится на верхнюю и нижнюю половинки. Фигуры «стыкуются» друг с другом и с
+рельефом дна только при выполнении условия сочетаемости (сумма кодов = 9).
+
+Расчётная модель — единый массив M_STATE (ms):
+    ms[col][row] = [верхняя_половинка, нижняя_половинка]
+    верхняя половинка хранит коды 1-4, нижняя — коды 5-8 (0 = пусто).
 """
 
-import pygame, random, math, sys, os, asyncio
+import pygame, random, json, os, sys, asyncio
 from array import array
 
-# ── Цвета 7 типов гексов (порядок как в задании и в нижней палитре) ───────
-# синий, зелёный, жёлтый, красный, фиолетовый, коричневый, белый.
-COLORS = [
-    ( 72,  72, 240),   # 0 синий
-    ( 72, 240,  72),   # 1 зелёный
-    (240, 240,  72),   # 2 жёлтый
-    (240,  72,  72),   # 3 красный
-    (240,  72, 240),   # 4 фиолетовый
-    (168,  72,   0),   # 5 коричневый
-    (240, 240, 240),   # 6 белый
-]
-NCOLORS = len(COLORS)
+# ── Пути к файлам (работают и при сборке в один EXE через PyInstaller) ────
+def resource_path(name):
+    """Путь к ВШИТОМУ ресурсу только для чтения (спрайты, картинки, SPHERIX.DAT).
 
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-HEX_BORDER = (40, 70, 70)     # тонкая граница между гексами (как на скриншоте)
-UI_YELLOW = (255, 255, 90)    # активный пункт меню
-UI_GREEN  = (110, 240, 110)   # выбранный ответ
-UI_GRAY   = (150, 150, 150)   # ещё не активный пункт
+    В собранном EXE (PyInstaller) ресурсы распаковываются во временную папку
+    sys._MEIPASS; при обычном запуске — берутся рядом со скриптом.
+    """
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
 
-# ── Геометрия поля ───────────────────────────────────────────────────────
-COLS, ROWS = 28, 16           # 28 столбцов × 16 рядов = 448 гексов
-HEX_R = 18                    # радиус (центр→вершина) шестиугольника
-HW = math.sqrt(3) * HEX_R     # ширина гекса (между плоскими боковыми гранями)
-VSTEP = 1.5 * HEX_R           # шаг между рядами по вертикали
+def writable_path(name):
+    """Путь к ЗАПИСЫВАЕМОМУ файлу (рекорды, дамп) — рядом с EXE/скриптом.
 
-TOP_H    = 40                 # верхняя строка (счёт и подпись)
-MARGIN_X = 16                 # боковые поля
-GAP      = 14                 # зазор между полем и палитрой
-PAL_H    = 72                 # высота нижней палитры
-
-BOARD_W = HW * (COLS + 0.5)                  # ширина поля в пикселях
-BOARD_H = VSTEP * (ROWS - 1) + 2 * HEX_R     # высота поля в пикселях
-
-SCREEN_W = int(BOARD_W + 2 * MARGIN_X)
-SCREEN_H = int(TOP_H + BOARD_H + GAP + PAL_H + MARGIN_X)
-
-BOARD_X0 = MARGIN_X           # левый край поля
-BOARD_Y0 = TOP_H              # верхний край поля
-
-# ── Нижние палитры (две: P1 слева, P2 справа) ────────────────────────────
-PAL_MARGIN  = 30              # отступ крайнего гекса палитры от края экрана
-PAL_STEP    = 61             # шаг между гексами в палитре
-PAL_Y       = TOP_H + BOARD_H + GAP + PAL_H / 2   # центр палитр по вертикали
-MARKER_SIZE = int(2 * HW)    # сторона квадрата-маркера (~2× размера гекса)
-
-
-def palette_center(player, i):
-    """Центр i-го гекса (0..6) в палитре игрока player (0 — левая, 1 — правая)."""
-    if player == 0:
-        cx = PAL_MARGIN + i * PAL_STEP
+    Нельзя писать в sys._MEIPASS: эта папка удаляется при выходе из EXE, и
+    рекорды бы не сохранялись.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))   # папка с EXE
     else:
-        cx = SCREEN_W - PAL_MARGIN - (NCOLORS - 1 - i) * PAL_STEP
-    return cx, PAL_Y
+        base = os.path.dirname(os.path.abspath(__file__))         # папка со скриптом
+    return os.path.join(base, name)
 
+# ── Геометрия экрана и игрового поля ─────────────────────────────────────
+# Все размеры в пикселях масштабируются множителем SCALE.
+SCALE    = 2
+COL_W    = 20 * SCALE          # ширина одной колонки поля = 40 px
+ROW_H    = 16 * SCALE          # высота одного ряда поля   = 32 px
+GRID_COLS = 10                 # рабочих колонок поля: 1-10
+GRID_ROWS = 22                 # рядов: 0-22 (0 и 22 — границы)
 
-def hex_center(col, row):
-    """Пиксельный центр гекса (col, row). Нечётные ряды смещены вправо на пол-гекса."""
-    cx = BOARD_X0 + HW / 2 + col * HW + (row & 1) * (HW / 2)
-    cy = BOARD_Y0 + HEX_R + row * VSTEP
-    return cx, cy
+# Левая панель подсказок, отступы игрового поля и правая панель счёта.
+SIDEBAR_W = 160                # ширина левой панели с раскладкой клавиш
+PLAY_X    = SIDEBAR_W + 5      # X-координата левого края поля (зазор 5 px от панели)
+PLAY_Y    = 16                 # Y-координата верхнего края поля
+RIGHT_X   = PLAY_X + GRID_COLS * COL_W + 16   # X начала правой панели
+RIGHT_W   = 180                # ширина правой панели (уровень/линии/счёт)
+SCREEN_W  = RIGHT_X + RIGHT_W + 8             # полная ширина окна
+SCREEN_H  = PLAY_Y + 21 * ROW_H + 16          # высота окна (видимы ряды 1-21)
 
+FPS = 60                       # частота обновления экрана
+# Файл рекордов лежит рядом с EXE/скриптом (записываемый — не во временной папке).
+HISTORY_FILE = writable_path("SPHERIX.HIS")
 
-def hex_points(cx, cy, r=HEX_R):
-    """6 вершин «pointy-top» шестиугольника (вершины сверху и снизу)."""
-    hw = math.sqrt(3) * r / 2
-    return [
-        (cx,      cy - r),       # верх
-        (cx + hw, cy - r / 2),   # верх-право
-        (cx + hw, cy + r / 2),   # низ-право
-        (cx,      cy + r),       # низ
-        (cx - hw, cy + r / 2),   # низ-лево
-        (cx - hw, cy - r / 2),   # верх-лево
-    ]
+# ── Отладка сокращения рядов ─────────────────────────────────────────────
+# Поставьте DUMP_CLEARS = True, чтобы при каждой попытке снять ПОЛНЫЙ ряд в
+# файл mstate_dump.txt писались значения M_STATE 5 нижних рядов до и после
+# сокращения (и отметка, если ряд полон, но заблокирован can_clear=False).
+DUMP_CLEARS = False
+DUMP_FILE   = writable_path("mstate_dump.txt")
 
+def _fmt_ms_rows(ms, nrows=5):
+    """Текст значений M_STATE для нижних nrows рядов (по две цифры на клетку:
+    верхняя и нижняя половинки)."""
+    lines = []
+    for row in range(1, nrows + 1):
+        cells = " ".join("%d%d" % (ms[c][row][0], ms[c][row][1])
+                         for c in range(1, GRID_COLS + 1))
+        lines.append("  r%2d: %s" % (row, cells))
+    return "\n".join(lines)
 
-# ── Соседство гексов (pointy-top, раскладка "odd-r": нечётные ряды сдвинуты вправо)
-# Смещения [dcol, drow] до 6 соседей, отдельно для чётных и нечётных рядов.
-_ODDR_EVEN = [(+1, 0), (0, -1), (-1, -1), (-1, 0), (-1, +1), (0, +1)]
-_ODDR_ODD  = [(+1, 0), (+1, -1), (0, -1), (-1, 0), (0, +1), (+1, +1)]
+def _append_dump(text):
+    """Дописать блок текста в файл дампа (ошибки записи игнорируем)."""
+    try:
+        with open(DUMP_FILE, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
 
-def neighbors(col, row):
-    """Список соседних клеток (по граням) в пределах поля."""
-    table = _ODDR_ODD if (row & 1) else _ODDR_EVEN
-    res = []
-    for dc, dr in table:
-        c, r = col + dc, row + dr
-        if 0 <= c < COLS and 0 <= r < ROWS:
-            res.append((c, r))
-    return res
+# ── Задержка падения по уровням ──────────────────────────────────────────
+# Секунд между автоматическими шагами фигуры вниз. Чем выше уровень — тем
+# меньше задержка и тем быстрее игра. Индекс = номер уровня (0-9).
+LEVEL_DELAY = [2.0, 1.5, 1.25, 1.2, 0.7, 0.4, 0.2, 0.15, 0.1, 0.05]
 
+# Пауза (с) после касания опоры, в течение которой фигуру ещё можно сдвинуть
+# вбок клавишами 4/6 (чтобы достроить пирамиду сбоку), прежде чем она осядет.
+LAND_PAUSE = 0.5
 
-# ── Состояние партии ─────────────────────────────────────────────────────
-class Game:
-    def __init__(self):
-        # color[col][row] — индекс цвета (0..6)
-        self.color = [[random.randrange(NCOLORS) for _ in range(ROWS)]
-                      for _ in range(COLS)]
-        # owner[col][row] — кому принадлежит гекс: None / 0 / 1
-        self.owner = [[None] * ROWS for _ in range(COLS)]
-        self.cur_color = [0, 0]        # текущий цвет группы каждого игрока
-        self.score = [0, 0]            # очки игроков = размеры групп
-        self.turn = 0                  # чей ход: 0 — первый игрок, 1 — второй
-        self.marker = [0, 0]           # позиция маркера в палитре каждого игрока
-        # Стартовые группы: P1 — из левого-нижнего угла, P2 — из правого-верхнего.
-        self._init_groups()
-        self._update_score()
-        # Маркеры обоих игроков — на крайний левый доступный цвет.
-        self.reset_marker_left(0)
-        self.reset_marker_left(1)
+# ── Палитра (цвета в стиле EGA) ──────────────────────────────────────────
+BLACK  = (  0,   0,   0)
+WHITE  = (255, 255, 255)
+YELLOW = (255, 255,  85)
+LCYAN  = ( 85, 255, 255)
+LGREEN = ( 85, 255,  85)
+LMAG   = (255,  85, 255)
+LRED   = (255,  85,  85)
+LGRAY  = (170, 170, 170)
+DGRAY  = ( 85,  85,  85)
+BLUE   = (  0,   0, 170)
+LBLUE  = ( 85,  85, 255)
 
-    # ── Стартовые группы ─────────────────────────────────────────────────
-    def _init_groups(self):
-        """Каждый игрок владеет связной одноцветной группой со своим углом."""
-        self._flood_claim(0, ROWS - 1, 0)          # P1 — левый-нижний угол
-        self._flood_claim(COLS - 1, 0, 1)          # P2 — правый-верхний угол
+# Цвет каждой фигуры (используется в «запасном» режиме рисования блоками,
+# когда спрайты по какой-то причине не загрузились).
+FIG_COLOR = {1: WHITE, 2: LCYAN, 3: LGREEN, 4: YELLOW, 5: LMAG, 6: LRED}
 
-    def _flood_claim(self, sc, sr, player):
-        """Захватить связную область цвета угла, начиная с (sc, sr), за player.
+# Цвета достраиваемых «полуфигур» у боковых стенок (см. fill_walls()).
+WALL_PURPLE = (150,  70, 230)   # фиолетовый
+WALL_PINK   = (255, 120, 200)   # розовый
+WALL_YELLOW = (255, 230,  60)   # жёлтый
+WALL_BLUE   = ( 70, 100, 235)   # синий
+WALL_GREEN  = ( 70, 220,  90)   # зелёный
+WALL_ORANGE = (255, 150,  40)   # оранжевый
 
-        Не трогает клетки, уже занятые другим игроком.
-        """
-        from collections import deque
-        col0 = self.color[sc][sr]
-        if self.owner[sc][sr] is not None:
-            return
-        self.owner[sc][sr] = player
-        q = deque([(sc, sr)])
-        while q:
-            c, r = q.popleft()
-            for nc, nr in neighbors(c, r):
-                if self.owner[nc][nr] is None and self.color[nc][nr] == col0:
-                    self.owner[nc][nr] = player
-                    q.append((nc, nr))
-        self.cur_color[player] = col0
-
-    # ── Клетки игрока и счёт ──────────────────────────────────────────────
-    def cells_of(self, player):
-        return [(c, r) for c in range(COLS) for r in range(ROWS)
-                if self.owner[c][r] == player]
-
-    def _update_score(self):
-        for p in (0, 1):
-            self.score[p] = sum(1 for c in range(COLS) for r in range(ROWS)
-                                if self.owner[c][r] == p)
-
-    # ── Ход: выбор цвета → перекраска группы + захват прилегающих ─────────
-    def apply_move(self, player, new_color):
-        """Игрок player выбирает цвет new_color: вся его группа перекрашивается
-        в этот цвет и захватывает все смежные (по граням) свободные гексы того
-        же цвета (повторная заливка). Обновляет текущий цвет и счёт."""
-        from collections import deque
-        cells = self.cells_of(player)
-        # Перекрашиваем свою группу в новый цвет.
-        for c, r in cells:
-            self.color[c][r] = new_color
-        # Заливка: захватываем смежные свободные гексы нужного цвета.
-        q = deque(cells)
-        while q:
-            c, r = q.popleft()
-            for nc, nr in neighbors(c, r):
-                if self.owner[nc][nr] is None and self.color[nc][nr] == new_color:
-                    self.owner[nc][nr] = player
-                    q.append((nc, nr))
-        self.cur_color[player] = new_color
-        self._update_score()
-
-    # ── Маркер выбора цвета ───────────────────────────────────────────────
-    def valid_colors(self, player):
-        """Цвета, доступные игроку для хода: все, кроме своего текущего и
-        текущего цвета противника."""
-        excl = {self.cur_color[player], self.cur_color[1 - player]}
-        return [i for i in range(NCOLORS) if i not in excl]
-
-    def move_marker(self, player, direction):
-        """Сдвинуть маркер игрока на 1 в сторону direction (+1 вправо/-1 влево),
-        по кругу, ПРОПУСКАЯ недоступные цвета (оба текущих)."""
-        valid = self.valid_colors(player)
-        if not valid:
-            return
-        i = self.marker[player]
-        for _ in range(NCOLORS):
-            i = (i + direction) % NCOLORS
-            if i in valid:
-                self.marker[player] = i
-                return
-
-    def ensure_valid_marker(self, player):
-        """Если маркер игрока оказался на недоступном цвете — перевести на
-        ближайший доступный (вправо)."""
-        if self.marker[player] not in self.valid_colors(player):
-            self.move_marker(player, +1)
-
-    def reset_marker_left(self, player):
-        """Поставить маркер на КРАЙНИЙ ЛЕВЫЙ доступный цвет палитры (мин. индекс).
-        Вызывается перед ходом игрока, чтобы маркер не «прыгал»."""
-        valid = self.valid_colors(player)
-        if valid:
-            self.marker[player] = min(valid)
-
-    def clone(self):
-        """Лёгкая копия состояния (для просчёта ходов ИИ)."""
-        g = Game.__new__(Game)
-        g.color = [col[:] for col in self.color]
-        g.owner = [col[:] for col in self.owner]
-        g.cur_color = self.cur_color[:]
-        g.score = self.score[:]
-        g.turn = self.turn
-        g.marker = self.marker[:]
-        return g
-
-
-# ── Искусственный интеллект (Beginner / Expert / Master = 1 / 2 / 3 хода) ──
-def weighted_gain_apply(game, player, color):
-    """Применить ход цветом color к game (МУТИРУЕТ game) и вернуть взвешенный
-    прирост: захваченные на этом ходу гексы считаются за 2, если они выходят
-    ЗА ПРАВЫЙ КРАЙ группы (для P1) / ЗА ЛЕВЫЙ КРАЙ (для P2), иначе за 1.
-
-    Это поощряет стремление «только вперёд» — наступление в сторону соперника.
-    """
-    cells_before = game.cells_of(player)
-    if not cells_before:
-        game.apply_move(player, color)
-        return 0
-    # край группы по X до хода: правый для P1, левый для P2
-    xs = [hex_center(c, r)[0] for c, r in cells_before]
-    edge = max(xs) if player == 0 else min(xs)
-    before = set(cells_before)
-    game.apply_move(player, color)
-    val = 0
-    for c in range(COLS):
-        for r in range(ROWS):
-            if game.owner[c][r] == player and (c, r) not in before:
-                cx = hex_center(c, r)[0]
-                forward = (cx > edge) if player == 0 else (cx < edge)
-                val += 2 if forward else 1
-    return val
-
-
-def _minimax(game, mover, ai, depth):
-    """Минимакс по взвешенному прир. очков. Возвращает (взв.прирост ai − opp)
-    при оптимальной игре обоих на оставшуюся глубину."""
-    if depth == 0:
-        return 0
-    valids = game.valid_colors(mover)
-    if not valids:
-        return 0
-    best = None
-    for color in valids:
-        g2 = game.clone()
-        gain = weighted_gain_apply(g2, mover, color)
-        sub = _minimax(g2, 1 - mover, ai, depth - 1)
-        val = (gain if mover == ai else -gain) + sub
-        if best is None:
-            best = val
-        elif mover == ai:
-            best = max(best, val)
-        else:
-            best = min(best, val)
-    return best if best is not None else 0
-
-
-# ── Параметры «ошибок» ИИ (на стадии отладки легко варьировать) ──────────
-# Безошибочный ИИ скучен, поэтому с вероятностью MISTAKE_PROB[уровень] ИИ делает
-# «мягкую» ошибку: берёт не лучший ход, а СЛУЧАЙНЫЙ из MISTAKE_TOPN лучших.
-MISTAKE_PROB = {
-    1: 0.10,   # Beginner
-    2: 0.05,   # Expert
-    3: 0.01,   # Master
+# ── Описание фигур в модели M_STATE ──────────────────────────────────────
+# Каждая фигура занимает квадрат 2×2 клетки. Для каждого её положения
+# (поворота) задаются коды половинок:
+#   запись = [[UL_k2, UR_k2], [LL_k1, LR_k1]]
+#     UL_k2, UR_k2 — нижние половинки ВЕРХНЕГО ряда фигуры (коды 5-8);
+#     LL_k1, LR_k1 — верхние половинки НИЖНЕГО ряда фигуры (коды 1-4).
+# Условие стыковки: код нижней половинки фигуры + код половинки под ней = 9.
+# Пары сочетаемости: 1+8, 2+7, 3+6, 4+5.
+# Кол-во вогнутостей у фигур: F1=0, F2=1, F3=2 смежные,
+#                              F4=2 по диагонали, F5=3, F6=4.
+MS_FIGURES = {
+    1: [ [[6,5],[2,1]] ],                              # круг — 1 положение
+    2: [ [[8,5],[2,1]], [[6,7],[2,1]],
+         [[6,5],[2,3]], [[6,5],[4,1]] ],               # 4 положения
+    3: [ [[8,7],[2,1]], [[6,7],[2,3]],
+         [[6,5],[4,3]], [[8,5],[4,1]] ],               # 4 положения
+    4: [ [[8,5],[2,3]], [[6,7],[4,1]] ],               # 2 положения
+    5: [ [[8,7],[4,1]], [[8,7],[2,3]],
+         [[6,7],[4,3]], [[8,5],[4,3]] ],               # 4 положения
+    6: [ [[8,7],[4,3]] ],                              # крест — 1 положение
 }
-MISTAKE_TOPN = 3   # из скольких лучших ходов выбирать при «ошибке» (2–3)
+# Псевдоним для запросов количества поворотов в функциях отрисовки.
+FIGURES = {fig: MS_FIGURES[fig] for fig in MS_FIGURES}
+
+# «Посадочные» пары поверхности — те, на которые какая-либо фигура может лечь
+# комплементарно (сумма=9). Низ фигур (LL,LR) бывает (2,1),(2,3),(4,1),(4,3),
+# что соответствует парам поверхности (9-LL)(9-LR) = 78, 76, 58, 56. Только
+# эти пары учитываются в анализе поверхности (см. Game._surface_pairs).
+_LANDING_PAIRS = frozenset({56, 58, 76, 78})
+
+# ── Начальный рельеф дна колодца ─────────────────────────────────────────
+# Коды нижних половинок (k=1) для ряда 1, колонки 1-10. Распознаны из
+# изображения ref_bottom_new.png. Индексы 0 и 11 не используются (стенки).
+BOTTOM_PATTERN = [0, 5, 6, 7, 6, 5, 8, 5, 8, 7, 8, 0]
 
 
-def ai_choose(game, player, level):
-    """Выбрать цвет хода для ИИ уровня level (1 Beginner / 2 Expert / 3 Master).
+# ── Случайный выбор фигуры ───────────────────────────────────────────────
+def random_figure():
+    """Вернуть номер фигуры (1-6) равновероятно (по 1/6 на каждую)."""
+    return random.randint(1, 6)
 
-    Обычно — лучший ход по взвешенной оценке (тай-брейк: P1 самый ПРАВЫЙ цвет
-    палитры, P2 — самый ЛЕВЫЙ). С вероятностью MISTAKE_PROB[level] делается
-    «мягкая» ошибка: случайный из MISTAKE_TOPN лучших ходов.
+
+# ── Ввод/вывод таблицы рекордов ──────────────────────────────────────────
+# В браузере (pygbag) файловая система не сохраняется между перезагрузками,
+# поэтому рекорды храним в localStorage браузера; на десктопе — в JSON-файле.
+SCORES_KEY = "spherix_scores"
+
+def _read_scores_raw():
+    """Прочитать «сырой» JSON-текст рекордов (localStorage в браузере / файл)."""
+    if sys.platform == "emscripten":
+        import platform
+        v = platform.window.localStorage.getItem(SCORES_KEY)
+        return None if v is None else str(v)
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            return f.read()
+    return None
+
+def load_scores():
+    """Загрузить до 10 рекордов; вернуть пустую таблицу при отсутствии/сбое."""
+    blank = [{"name": "   ", "lines": 0, "score": 0} for _ in range(10)]
+    try:
+        raw = _read_scores_raw()
+        if not raw:                      # ничего не сохранено — пустая таблица
+            save_scores(blank)
+            return blank
+        data = json.loads(raw)
+        result = data[:10]
+        while len(result) < 10:          # дополняем пустыми строками до 10
+            result.append({"name": "   ", "lines": 0, "score": 0})
+        return result
+    except Exception:
+        # Данные повреждены или не читаются — возвращаем пустую таблицу.
+        return blank[:]
+
+def save_scores(scores):
+    """Сохранить таблицу рекордов (≤10 строк): localStorage в браузере / файл."""
+    try:
+        text = json.dumps(scores[:10], ensure_ascii=False)
+        if sys.platform == "emscripten":
+            import platform
+            platform.window.localStorage.setItem(SCORES_KEY, text)
+        else:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                f.write(text)
+    except Exception:
+        # Ошибку записи молча игнорируем — рекорды не критичны для игры.
+        pass
+
+def insert_score(scores, name, lines, score):
+    """Добавить новый результат, отсортировать по убыванию счёта, оставить топ-10."""
+    scores.append({"name": name, "lines": lines, "score": score})
+    scores.sort(key=lambda e: -e["score"])
+    return scores[:10]
+
+
+# ── Создание массива M_STATE ─────────────────────────────────────────────
+def make_ms():
+    """Создать и вернуть массив состояния поля ms[col][row] = [верх, низ].
+
+    Раскладка индексов:
+        col 1-10  — рабочие колонки (0 и 11 — стенки);
+        row 1     — нижний ряд (дно колодца);
+        row 21    — верхний ряд, куда появляется фигура.
+    Значения половинок:
+        верхняя (индекс 0) — коды 1-4 или 0;
+        нижняя  (индекс 1) — коды 5-8 или 0.
     """
-    valids = game.valid_colors(player)
-    if not valids:
-        return None
-    scored = []
-    for color in valids:
-        g2 = game.clone()
-        gain = weighted_gain_apply(g2, player, color)
-        sub = _minimax(g2, 1 - player, player, level - 1)
-        scored.append((gain + sub, color))
-    scored.sort(key=lambda t: t[0], reverse=True)   # по убыванию оценки
-
-    # «Мягкая» ошибка: случайный ход из нескольких лучших.
-    if random.random() < MISTAKE_PROB.get(level, 0):
-        return random.choice(scored[:MISTAKE_TOPN])[1]
-
-    # Иначе — лучший ход; тай-брейк среди равных по оценке.
-    best_val = scored[0][0]
-    cands = [c for v, c in scored if v == best_val]
-    return max(cands) if player == 0 else min(cands)
+    # Все клетки изначально пусты: [0, 0].
+    ms = [[[0, 0] for _ in range(23)] for _ in range(GRID_COLS + 2)]
+    # Заполняем нижние половинки ряда 1 начальным рельефом дна.
+    for c in range(1, GRID_COLS + 1):
+        ms[c][1][1] = BOTTOM_PATTERN[c]
+    return ms
 
 
-# ── Отрисовка ────────────────────────────────────────────────────────────
-def draw_board(surf, game):
-    """Нарисовать все гексы поля."""
-    for col in range(COLS):
-        for row in range(ROWS):
-            cx, cy = hex_center(col, row)
-            pts = hex_points(cx, cy)
-            pygame.draw.polygon(surf, COLORS[game.color[col][row]], pts)
-            pygame.draw.polygon(surf, HEX_BORDER, pts, 1)
-
-
-def draw_top(surf, font, game):
-    """Верхняя строка: счёт игроков по краям, подпись по центру."""
-    left = font.render("= %d =" % game.score[0], True, WHITE)
-    right = font.render("= %d =" % game.score[1], True, WHITE)
-    title = font.render("Game by Skudarnov I., 1991", True, WHITE)
-    surf.blit(left, (MARGIN_X, (TOP_H - left.get_height()) // 2))
-    surf.blit(right, (SCREEN_W - MARGIN_X - right.get_width(),
-                      (TOP_H - right.get_height()) // 2))
-    surf.blit(title, ((SCREEN_W - title.get_width()) // 2,
-                      (TOP_H - title.get_height()) // 2))
-
-
-def draw_palette(surf, game):
-    """Две нижние палитры (P1 слева, P2 справа) по 7 цветных гексов.
-
-    Квадратный маркер (~2× размера гекса, гекс по центру) рисуется на палитре
-    того игрока, чей сейчас ход.
+def _concave_on_concave(upper, lower):
+    """True, если верхняя половинка фигуры (1-4) села впадиной на впадину опоры
+    (5-8): валидны только пары 3+8 и 4+7 (сумма = 11). Клетки заняты, но между
+    дугами остаётся зазор, поэтому такой ряд сокращать нельзя.
     """
-    for player in (0, 1):
-        for i in range(NCOLORS):
-            cx, cy = palette_center(player, i)
-            pts = hex_points(cx, cy, HEX_R)
-            pygame.draw.polygon(surf, COLORS[i], pts)
-            pygame.draw.polygon(surf, HEX_BORDER, pts, 1)
-    # Маркер на палитре текущего игрока.
-    cx, cy = palette_center(game.turn, game.marker[game.turn])
-    s = MARKER_SIZE
-    pygame.draw.rect(surf, WHITE, (int(cx - s / 2), int(cy - s / 2), s, s), 2)
+    return upper + lower == 11
 
 
-# ── Ввод игрока ───────────────────────────────────────────────────────────
-# Клавиши: P1 — z (влево), x (выбор), c (вправо); P2 — 1/2/3 цифр. панели.
-P1_LEFT, P1_SELECT, P1_RIGHT = (pygame.K_z,), (pygame.K_x,), (pygame.K_c,)
-P2_LEFT   = (pygame.K_KP1, pygame.K_1)
-P2_SELECT = (pygame.K_KP2, pygame.K_2)
-P2_RIGHT  = (pygame.K_KP3, pygame.K_3)
-
-def handle_key(game, key):
-    """Обработать нажатие для ТЕКУЩЕГО игрока. Возвращает True, если сделан ход."""
-    p = game.turn
-    left, select, right = (P1_LEFT, P1_SELECT, P1_RIGHT) if p == 0 \
-        else (P2_LEFT, P2_SELECT, P2_RIGHT)
-    if key in left:
-        game.move_marker(p, -1)
-    elif key in right:
-        game.move_marker(p, +1)
-    elif key in select:
-        game.apply_move(p, game.marker[p])       # ход выбранным цветом
-        return True                                # передачу хода делает run_game (done)
+def _merge_ok(u, v):
+    """Можно ли совместить в ОДНОЙ клетке верхнюю половинку фигуры u (1-4) и
+    нижнюю половинку опоры v (5-8 или 0):
+      - v == 0       — опора пуста, фигура падает дальше;
+      - u + v == 9   — комплементарно (выпуклость точно входит во впадину):
+                       1+8, 2+7, 3+6, 4+5;
+      - u + v == 11  — «впадина на впадину» (вогнутости противоположной
+                       ориентации не перекрываются): только 3+8 и 4+7.
+                       Прочие пары вогнутых (3+7=10, 4+8=12) не уживаются.
+    Иначе (выпуклость на выпуклость или несовпадение ориентаций) дуги
+    перекрылись бы — слияние невозможно, и фигура останавливается на ряд выше.
+    """
+    if v == 0:
+        return True
+    if u + v == 9:
+        return True
+    if u + v == 11:
+        return True
     return False
 
 
-def redraw(surf, font, game, remain=None):
-    surf.fill(BLACK)
-    draw_top(surf, font, game)
-    draw_board(surf, game)
-    draw_palette(surf, game)
-    # Обратный отсчёт времени на ход (в зазоре между палитрами).
-    if remain is not None:
-        t = font.render(str(int(remain)), True, UI_YELLOW)
-        surf.blit(t, (SCREEN_W // 2 - t.get_width() // 2,
-                      int(PAL_Y) - t.get_height() // 2))
+def well_cell_rect(col, row):
+    """Прямоугольник клетки (col, row) в ЛОКАЛЬНЫХ координатах изображения
+    колодца (left-top = 0,0; ряд 21 сверху, ряд 1 снизу)."""
+    return pygame.Rect((col - 1) * COL_W, (21 - row) * ROW_H, COL_W, ROW_H)
 
 
-# ── Стартовый экран (выбор игроков, уровня, времени) ─────────────────────
-async def wait_key():
-    """Дождаться нажатия клавиши или закрытия окна; вернуть событие.
+# ── Класс игры: всё состояние одной партии и правила движения ─────────────
+class Game:
+    def __init__(self, level=0):
+        """Инициализировать партию: поле, счётчики, первую и следующую фигуры."""
+        # Игровое поле в модели M_STATE.
+        self.ms        = make_ms()
+        # Текущий уровень скорости и игровые счётчики.
+        self.level       = level
+        self.start_level = level   # уровень, выбранный в начале партии
+        self.score       = 0.0
+        self.lines       = 0
+        # Флаги настроек/режима.
+        self.sound     = True      # звук вкл/выкл
+        self.show_next = False     # показывать ли «следующую» фигуру
+        # Флаг «следующая фигура была заменена фильтром» — для надписи-поздравления
+        # (показывается, пока игрок не нажмёт клавишу; тогда +1 очко).
+        self.replaced  = False
 
-    Неблокирующий опрос (await каждый кадр) — обязателен для pygbag/браузера.
+        # Заранее выбираем следующую фигуру и порождаем текущую.
+        self.next_fig  = random_figure()
+        self._spawn()
+
+        # Таймер автоматического падения и флаг конца игры.
+        self.drop_t    = 0.0
+        # Таймер «паузы приземления»: после касания опоры фигура ~0.5 с стоит,
+        # давая возможность сдвинуть её вбок (клавиши 4/6), прежде чем осесть.
+        self.land_t    = 0.0
+        self.over      = False
+        # Список приземлившихся фигур (история; для отрисовки больше не нужен —
+        # осевшие фигуры хранятся в постоянном изображении колодца self.well).
+        self.landed    = []
+        # Все достроенные у стенок «полуфигуры» (история):
+        # каждый элемент — (колонка, ряд, слот, значение_ms, цвет).
+        self.wall_fills = []
+        # Максимальная высота осевших фигур — чтобы при сокращении ряда
+        # пересчитывать M_STATE не до самого верха, а только до v_max+1.
+        self.v_max = 1
+        # Флаги «ряд можно сократить» по рядам: становится False, если в этот
+        # ряд фигура села впадиной на впадину (клетки заняты, но есть зазор).
+        self.can_clear = [True] * 23
+        # Постоянное изображение осевшего колодца: на него «впечатываем» каждую
+        # остановившуюся фигуру, а при сокращении ряда сдвигаем его на ряд вниз.
+        # Падающая фигура рисуется спрайтом поверх этого изображения.
+        self.well = None
+        self._init_well()
+
+    # ── Изображение осевшего колодца ─────────────────────────────────────
+    def _init_well(self):
+        """Создать пустое изображение колодца и впечатать в него рельеф дна.
+
+        Рельеф — часть изображения колодца (ряд 1), поэтому при сокращении
+        самого нижнего ряда он естественным образом уезжает вниз и исчезает.
+        """
+        try:
+            self.well = pygame.Surface((GRID_COLS * COL_W, 21 * ROW_H),
+                                       pygame.SRCALPHA)
+        except Exception:
+            self.well = None
+            return
+        self.well.fill((0, 0, 0, 0))
+        # Рельеф дна (ряд 1) в локальных координатах колодца: y = 20*ROW_H.
+        if _bottom_surf is not None:
+            self.well.blit(_bottom_surf, (0, 20 * ROW_H))
+
+    def _bake_piece(self, new_fills):
+        """Впечатать в изображение колодца только что остановившуюся фигуру.
+
+        Сначала рисуем достройки у стенок (комплемент уйдёт под спрайт),
+        затем спрайт самой фигуры поверх них.
+        """
+        if self.well is None:
+            return
+        # Достройки у стенок (дуги-четвертинки).
+        for (wc, wr, slot, val, color) in new_fills:
+            _draw_arc_cell(self.well, well_cell_rect(wc, wr), val, color)
+        # Спрайт фигуры в локальных координатах колодца.
+        name = _sprite_name(self.fig, self._rot_idx())
+        if name and name in _sprites:
+            self.well.blit(_sprites[name],
+                           ((self.col - 1) * COL_W, (21 - self.row) * ROW_H))
+
+    # ── Текущий поворот фигуры ───────────────────────────────────────────
+    def _rot_idx(self):
+        """Индекс текущего поворота с учётом числа доступных положений фигуры."""
+        rots = MS_FIGURES[self.fig]
+        return self.rotation % len(rots)
+
+    def _ms_def(self):
+        """Вернуть описание [[UL_k2,UR_k2],[LL_k1,LR_k1]] для текущей фигуры/поворота."""
+        return MS_FIGURES[self.fig][self._rot_idx()]
+
+    # ── Проверки столкновений по правилам M_STATE ────────────────────────
+    def touch_down(self):
+        """True, если фигура НЕ может опуститься ещё на один ряд."""
+        c, r = self.col, self.row
+        d = self._ms_def()
+        LL, LR = d[1]           # верхние половинки нижнего ряда фигуры (1-4)
+
+        # 1) Ниже дна колодца уходить нельзя.
+        if r - 2 < 1:
+            return True
+        # 2) Будущий верхний ряд (r-1): его нижние половинки должны быть свободны.
+        if self.ms[c][r-1][1] != 0 or self.ms[c+1][r-1][1] != 0:
+            return True
+        # 3) Будущий нижний ряд (r-2): его верхние половинки должны быть свободны.
+        if self.ms[c][r-2][0] != 0 or self.ms[c+1][r-2][0] != 0:
+            return True
+
+        # Коды нижних половинок опоры в ряду под фигурой (r-2).
+        vL = self.ms[c][r-2][1]
+        vR = self.ms[c+1][r-2][1]
+        # 4) Опуститься на ряд ниже можно, только если в ОБЕИХ колонках нижняя
+        #    половинка фигуры и нижняя половинка опоры могут ужиться в одной
+        #    клетке (пусто / сумма=9 / обе вогнутые). Это правило едино и для
+        #    рельефа дна (ряд 1): некомплементарная фигура остаётся на нём
+        #    сверху, а не проваливается сквозь выступы.
+        if _merge_ok(LL, vL) and _merge_ok(LR, vR):
+            return False
+        return True
+
+    def _side_cell_ok(self, col, row, q, q_slot):
+        """Может ли четвертинка фигуры q встать в клетку (col,row) в слот q_slot
+        (0 — верхняя половинка, 1 — нижняя) при боковом сдвиге.
+
+        Условия (аналогично движению вниз, но по горизонтали):
+          - нужный слот должен быть свободен (иначе перекрытие);
+          - если в соседнем слоте уже что-то есть e, то q и e должны быть
+            комплементарны (q+e == 9) либо «впадина на впадину» (q+e == 11).
+        """
+        # Слот, куда встаёт четвертинка фигуры, должен быть пуст.
+        if self.ms[col][row][q_slot] != 0:
+            return False
+        # Соседняя половинка той же клетки.
+        e = self.ms[col][row][1 - q_slot]
+        if e == 0:
+            return True
+        return q + e == 9 or q + e == 11
+
+    def touch_left(self):
+        """True, если фигура НЕ может сдвинуться влево.
+
+        При сдвиге фигура занимает колонку слева (c-1). Туда переходят её ЛЕВЫЕ
+        четвертинки: верхняя-левая UL (нижний слот) в клетку (c-1, r) и
+        нижняя-левая LL (верхний слот) в клетку (c-1, r-1). Проверяем, что они
+        вписываются (стенка / свободно / комплементарно / впадина-на-впадину).
+        """
+        if self.col <= 1:                 # левая стенка
+            return True
+        c, r = self.col, self.row
+        d = self._ms_def()
+        UL = d[0][0]   # верхняя-левая четвертинка (нижний слот, коды 5-8)
+        LL = d[1][0]   # нижняя-левая четвертинка (верхний слот, коды 1-4)
+        if not self._side_cell_ok(c - 1, r,     UL, 1):
+            return True
+        if not self._side_cell_ok(c - 1, r - 1, LL, 0):
+            return True
+        return False
+
+    def touch_right(self):
+        """True, если фигура НЕ может сдвинуться вправо.
+
+        Симметрично touch_left: фигура занимает колонку справа (c+2). Туда
+        переходят её ПРАВЫЕ четвертинки: верхняя-правая UR (нижний слот) в
+        клетку (c+2, r) и нижняя-правая LR (верхний слот) в клетку (c+2, r-1).
+        """
+        if self.col >= GRID_COLS - 1:     # правая стенка
+            return True
+        c, r = self.col, self.row
+        d = self._ms_def()
+        UR = d[0][1]   # верхняя-правая четвертинка (нижний слот, коды 5-8)
+        LR = d[1][1]   # нижняя-правая четвертинка (верхний слот, коды 1-4)
+        if not self._side_cell_ok(c + 2, r,     UR, 1):
+            return True
+        if not self._side_cell_ok(c + 2, r - 1, LR, 0):
+            return True
+        return False
+
+    # ── Горизонтальное перемещение ───────────────────────────────────────
+    def move_left(self):
+        """Сдвинуть фигуру влево, если слева свободно."""
+        if not self.touch_left():
+            self.col -= 1
+
+    def move_right(self):
+        """Сдвинуть фигуру вправо, если справа свободно."""
+        if not self.touch_right():
+            self.col += 1
+
+    # ── Приземление фигуры ───────────────────────────────────────────────
+    def land(self):
+        """Записать текущую фигуру в M_STATE окончательно (она стала частью поля)."""
+        c, r = self.col, self.row
+        d = self._ms_def()
+        UL, UR = d[0]   # нижние половинки верхнего ряда фигуры (5-8)
+        LL, LR = d[1]   # верхние половинки нижнего ряда фигуры (1-4)
+
+        # Перед записью смотрим, как фигура легла на опору снизу: «впадина на
+        # впадину» — это когда в нижнем ряду фигуры (r-1) обе половинки вогнутые:
+        # верхняя — это вписываемая LL/LR (коды 3/4), а нижняя — уже стоящая там
+        # опора ms[c][r-1][1] (коды 7/8). Сумма ≠ 9, клетки заняты, но между
+        # дугами остаётся зазор — такой ряд сокращать нельзя.
+        if _concave_on_concave(LL, self.ms[c][r-1][1]) or \
+           _concave_on_concave(LR, self.ms[c+1][r-1][1]):
+            self.can_clear[r-1] = False
+
+        # Верхний ряд фигуры: записываем нижние половинки.
+        self.ms[c][r][1]   = UL
+        self.ms[c+1][r][1] = UR
+        # Нижний ряд фигуры: записываем верхние половинки.
+        self.ms[c][r-1][0]   = LL
+        self.ms[c+1][r-1][0] = LR
+        # Запоминаем фигуру (история) и начисляем очки.
+        self.landed.append((self.fig, self._rot_idx(), c, r))
+        self.score += self.level
+
+        # Достраиваем полуфигуры у стенки; запоминаем только новые достройки,
+        # чтобы впечатать в колодец именно их (вместе со спрайтом фигуры).
+        n0 = len(self.wall_fills)
+        self.fill_walls()
+        new_fills = self.wall_fills[n0:]
+        self._bake_piece(new_fills)
+
+        # Обновляем максимальную высоту осевших фигур (учитываем и надстройки).
+        self.v_max = max(self.v_max, r)
+        for (wc, wr, slot, val, color) in new_fills:
+            self.v_max = max(self.v_max, wr)
+
+    # ── Достройка полуфигур у боковых стенок ─────────────────────────────
+    def fill_walls(self):
+        """Достроить четвертинки у стенки сразу после остановки фигуры.
+
+        Фигуры из четвертей окружности не прилегают вплотную к вертикальным
+        стенкам, поэтому у стенки приходится «дорисовывать» недостающие
+        полуфигуры (и заполнять соответствующие значения M_STATE), иначе
+        пристеночные колонки никогда не заполнятся и ряд нельзя будет снять.
+        Фигура шириной 2 колонки, поэтому одновременно касаться обеих стенок
+        не может — срабатывает максимум одна ветка.
+        """
+        c, r = self.col, self.row
+        # Касание левой стенки: левая колонка фигуры — это колонка 1.
+        if c == 1:
+            self._fill_wall_side(1, "left", r)
+        # Касание правой стенки: правая колонка фигуры — это колонка GRID_COLS.
+        if c + 1 == GRID_COLS:
+            self._fill_wall_side(GRID_COLS, "right", r)
+
+    def _fill_wall_side(self, wall_col, side, r):
+        """Достроить полуфигуры в одной пристеночной колонке wall_col.
+
+        В верхней клетке фигуры у стенки (ряд r) дополняем недостающую
+        половинку до сочетаемости (сумма = 9), а в клетке над ней (ряд r+1)
+        случайным образом надстраиваем новую выпуклость либо впадину.
+        Цвет пары клеток выбирается по таблице из задания.
+        """
+        # Нижняя половинка верхней клетки фигуры, прилегающей к стенке.
+        v = self.ms[wall_col][r][1]
+
+        if side == "left":
+            # У левой стенки значение либо 6 (выпуклость влево), либо 8 (впадина влево).
+            if v not in (6, 8):
+                return
+            comp  = 9 - v                    # 6→3 (правая впадина), 8→1 (правая выпуклость)
+            above = random.choice([5, 7])    # надстройка: 5 — выпуклость, 7 — впадина
+            if v == 6:
+                color = WALL_PURPLE if above == 5 else WALL_PINK
+            else:  # v == 8
+                color = WALL_YELLOW if above == 5 else WALL_PINK
+        else:  # side == "right"
+            # У правой стенки значение либо 5 (выпуклость вправо), либо 7 (впадина вправо).
+            if v not in (5, 7):
+                return
+            comp  = 9 - v                    # 5→4 (левая впадина), 7→2 (левая выпуклость)
+            above = random.choice([6, 8])    # надстройка: 6 — выпуклость, 8 — впадина
+            if v == 5:
+                color = WALL_BLUE if above == 6 else WALL_GREEN
+            else:  # v == 7
+                color = WALL_ORANGE if above == 6 else WALL_PURPLE
+
+        # Дополняем верхнюю половинку клетки фигуры у стенки комплементом.
+        self.ms[wall_col][r][0] = comp
+        self.wall_fills.append((wall_col, r, 0, comp, color))
+        # Надстраиваем нижнюю половинку клетки над ней — только если она свободна.
+        if r + 1 <= 21 and self.ms[wall_col][r + 1][1] == 0:
+            self.ms[wall_col][r + 1][1] = above
+            self.wall_fills.append((wall_col, r + 1, 1, above, color))
+
+    # ── Снятие заполненного ряда ─────────────────────────────────────────
+    def check_clear(self):
+        """Снять нижний ряд приземлившейся фигуры, если он полностью заполнен.
+
+        Ряд считается полным, когда у всех колонок заняты обе половинки И ряд
+        не помечен флагом can_clear=False (т.е. в него не садилась впадина на
+        впадину, оставившая зазор). Возвращает True, если ряд снят.
+        """
+        j = self.row - 1   # нижний ряд только что приземлившейся фигуры
+        # Защита от выхода за пределы поля.
+        if j < 1 or j > 21:
+            return False
+        # Полностью ли заполнен ряд (у всех колонок заняты обе половинки)?
+        full = all(self.ms[c][j][0] != 0 and self.ms[c][j][1] != 0
+                   for c in range(1, GRID_COLS + 1))
+        # Отладочный дамп M_STATE до сокращения (если включён DUMP_CLEARS).
+        before_dump = _fmt_ms_rows(self.ms) if (DUMP_CLEARS and full) else None
+        # Ряд, в который села впадина на впадину, сокращать запрещено.
+        if not self.can_clear[j]:
+            if before_dump is not None:
+                _append_dump("ряд j=%d ПОЛНЫЙ, но can_clear=False -> НЕ снят\n"
+                             "M_STATE (ряды 1..5):\n%s\n" % (j, before_dump))
+            return False
+        # Если ряд не полон — выходим.
+        if not full:
+            return False
+
+        # ── Расчётный аспект: сдвиг значений M_STATE на ряд вниз ──────────
+        # M_STATE[j] ← M_STATE[j+1], M_STATE[j+1] ← M_STATE[j+2], … Чтобы не
+        # пересчитывать пустоту до самого верха, идём только до v_max+1.
+        top = min(self.v_max + 1, 21)
+        for c in range(1, GRID_COLS + 1):
+            for row in range(j, top):
+                self.ms[c][row] = list(self.ms[c][row + 1])
+            self.ms[c][top] = [0, 0]
+        # Рельеф дна НЕ восстанавливаем: при сокращении нижнего ряда (j=1) он
+        # уезжает вместе со всем колодцем и исчезает — так и задумано.
+
+        # Флаги can_clear сдвигаем так же, как ряды M_STATE.
+        for row in range(j, top):
+            self.can_clear[row] = self.can_clear[row + 1]
+        self.can_clear[top] = True
+
+        # ── Графический аспект: сдвиг изображения колодца на ряд вниз ─────
+        self._shift_well_down(j)
+
+        # Высота осевших фигур уменьшилась на один ряд.
+        self.v_max = max(1, self.v_max - 1)
+        self.lines += 1
+        # Звук удаления ряда (как PLAY в оригинале), если звук включён (клавиша 7).
+        if self.sound:
+            play_clear_sound()
+        # Отладочный дамп M_STATE до/после сокращения (если включён DUMP_CLEARS).
+        if before_dump is not None:
+            _append_dump("=== СНЯТ ряд j=%d (v_max -> %d) ===\nДО:\n%s\nПОСЛЕ:\n%s\n"
+                         % (j, self.v_max, before_dump, _fmt_ms_rows(self.ms)))
+        return True
+
+    def _shift_well_down(self, j):
+        """Сдвинуть изображение колодца на один ряд вниз для рядов выше j.
+
+        Сохраняем часть изображения ВЫШЕ ряда j, переносим её на 1 ряд вниз
+        (накрывая сокращаемый ряд), сверху открываем пустой (прозрачный) ряд.
+        Часть колодца НИЖЕ ряда j остаётся без изменений.
+        """
+        if self.well is None:
+            return
+        W = self.well.get_width()
+        # Локальная Y-координата верхней границы сокращаемого ряда j.
+        cut_y = (21 - j) * ROW_H
+        # Сначала КОПИРУЕМ часть выше ряда j (до очистки!).
+        above = self.well.subsurface((0, 0, W, cut_y)).copy() if cut_y > 0 else None
+        # Очищаем полосу от верха до низа сокращаемого ряда включительно.
+        self.well.fill((0, 0, 0, 0), (0, 0, W, cut_y + ROW_H))
+        # Переносим сохранённую часть на один ряд вниз (накрывая ряд j).
+        if above is not None:
+            self.well.blit(above, (0, ROW_H))
+
+    # ── Анализ поверхности пирамиды и выбор допустимых фигур ──────────────
+    def _surface_pairs(self):
+        """Множество «посадочных» пар поверхности (массив M_PAR).
+
+        Для каждой колонки берём верхнюю «поверхностную» ячейку — первую сверху
+        заполненную, у которой нижняя половина ≠0, а верхняя =0 (открытую для
+        посадки). Для каждой пары соседних колонок (1-2, 2-3, …, 9-10), если их
+        поверхностные ячейки на одной высоте, код пары = левая*10 + правая.
+
+        В массив включаются ТОЛЬКО пары, которым соответствует какая-либо фигура
+        (низ фигуры комплементарен паре, сумма=9): это 56, 58, 76, 78. Прочие
+        пары (87, 65, 88 и т.п.) фигурам не соответствуют и в рассмотрение не
+        берутся — иначе они ломали бы критерии «вся поверхность только 56/78».
+        """
+        surf = {}    # колонка -> (высота, код нижней половины); код 0 = не поверхность
+        for j in range(1, GRID_COLS + 1):
+            surf[j] = (0, 0)
+            for row in range(21, 0, -1):
+                c = self.ms[j][row]
+                if c[0] != 0 or c[1] != 0:        # первая сверху заполненная ячейка
+                    # «чистая» поверхность только если верхняя половина пуста
+                    surf[j] = (row, c[1] if c[0] == 0 else 0)
+                    break
+        pairs = set()
+        for j in range(1, GRID_COLS):
+            hL, cL = surf[j]
+            hR, cR = surf[j + 1]
+            if cL != 0 and cR != 0 and hL == hR:
+                code = cL * 10 + cR
+                if code in _LANDING_PAIRS:        # пары без соответствующей фигуры пропускаем
+                    pairs.add(code)
+        return pairs
+
+    def _allowed_figures(self):
+        """Множество фигур (1-6), которым есть куда лечь на текущей поверхности.
+
+        Критерии исключения по массиву пар поверхности (M_PAR). Они НЕ
+        взаимоисключающие — проверяются все, исключённые фигуры объединяются:
+          1) нет пары 56          -> исключается крест F6 (ему негде лечь);
+          2) нет пары 78          -> исключается круг  F1;
+          3) поверхность только 56 -> исключаются F2 и F4;
+             поверхность только 78 -> исключаются F4 и F5;
+          4) поверхность только 56 и 78 -> исключается F4.
+        """
+        pairs = self._surface_pairs()
+        excluded = set()
+        if 56 not in pairs:
+            excluded.add(6)
+        if 78 not in pairs:
+            excluded.add(1)
+        if pairs == {56}:
+            excluded.update((2, 4))
+        if pairs == {78}:
+            excluded.update((4, 5))
+        if pairs == {56, 78}:
+            excluded.add(4)
+        allowed = [f for f in (1, 2, 3, 4, 5, 6) if f not in excluded]
+        return allowed or [1, 2, 3, 4, 5, 6]
+
+    # ── Появление новой фигуры ───────────────────────────────────────────
+    def _spawn(self):
+        """Поставить новую фигуру вверху по центру; выбрать следующую за ней.
+
+        Фигура из окна Next появляется только если ей есть куда лечь на текущей
+        поверхности пирамиды; иначе из допустимых фигур выбирается случайная.
+        """
+        allowed = self._allowed_figures()
+        if self.next_fig in allowed:
+            self.fig = self.next_fig
+        else:
+            # фигуру из Next пришлось заменить — отмечаем для надписи-поздравления,
+            # но только если игрок видит подсказку Next (клавиша 1).
+            self.fig = random.choice(allowed)
+            if self.show_next:
+                self.replaced = True
+        self.rotation = 0
+        self.col      = GRID_COLS // 2   # центр по горизонтали
+        self.row      = 21               # верхний ряд появления
+        self.next_fig = random_figure()
+
+    def spawn_next(self):
+        """Публичная обёртка для появления следующей фигуры."""
+        self._spawn()
+
+    # ── Повышение уровня ─────────────────────────────────────────────────
+    def try_level_up(self):
+        """Поднять уровень скорости после каждых 10 снятых рядов (до 9).
+
+        Уровень = стартовый + (снято рядов / 10), но не выше 9 и не ниже
+        текущего (ручное ускорение клавишей «+» не отменяется).
+        """
+        target = min(9, self.start_level + self.lines // 10)
+        if target > self.level:
+            if self.lines + 1 > self.level * 10:
+                self.level = self.level + 1
+
+    # ── Проверка конца игры ──────────────────────────────────────────────
+    def is_topped(self):
+        """True, если занята любая клетка верхнего ряда появления (стакан полон)."""
+        for c in range(1, GRID_COLS + 1):
+            if self.ms[c][20][0] != 0 or self.ms[c][20][1] != 0:
+                return True
+        return False
+
+    # ── Поворот фигуры (клавиша 5) ───────────────────────────────────────
+    def rotate(self):
+        """Повернуть фигуру по часовой стрелке.
+
+        Для круга (F1) и креста (F6) поворот ничего не меняет — сразу выходим,
+        это немного ускоряет расчёты.
+        """
+        if self.fig in (1, 6):
+            return
+        self.rotation = (self.rotation + 1) % len(MS_FIGURES[self.fig])
+
+    # ── Мгновенное падение (ПРОБЕЛ) ──────────────────────────────────────
+    def hard_drop(self):
+        """Сбросить фигуру до упора, приземлить и обработать последствия."""
+        # Опускаем, пока есть куда.
+        while not self.touch_down():
+            self.row -= 1
+        # Фиксируем фигуру, проверяем линию, уровень и конец игры.
+        self.land()
+        self.check_clear()
+        self.try_level_up()
+        if self.is_topped():
+            self.over = True
+        else:
+            self.spawn_next()
+
+
+# ── Звук ─────────────────────────────────────────────────────────────────
+# В оригинале (BASIC, строка 6840) при удалении ряда исполнялся оператор
+# PLAY с этой строкой нот (язык MML). Воспроизводим её при сокращении ряда.
+CLEAR_MML = "MBL16N24N16N40N48N24N16N40N48N24N16N40N48N24N16N40N48"
+SND_RATE  = 22050          # частота дискретизации
+_clear_sound = None        # готовый звук удаления ряда (строится в init_sound)
+
+def init_sound():
+    """Инициализировать микшер и построить звук удаления ряда из строки PLAY."""
+    global _clear_sound
+    try:
+        pygame.mixer.init(frequency=SND_RATE, size=-16, channels=1)
+        # С эффектом Доплера (удаляющийся источник) и пониженной громкостью.
+        _clear_sound = make_play_sound(CLEAR_MML, doppler=True)
+        if _clear_sound is not None:
+            _clear_sound.set_volume(0.4)
+    except Exception:
+        # Нет звукового устройства — играем без звука.
+        _clear_sound = None
+
+def _play_note_n(n):
+    """Частота (Гц) для ноты Nn из оператора PLAY (n=0 — пауза).
+
+    Привязка: N48 = 440 Гц (ля); каждый шаг n — полутон.
     """
+    if n <= 0:
+        return 0.0
+    return 440.0 * 2.0 ** ((n - 48) / 12.0)
+
+def make_play_sound(mml, doppler=False):
+    """Собрать pygame-звук из строки PLAY (MB, L, T, O, N, P, буквенные ноты A-G).
+    Тембр — меандр (как у PC-спикера).
+
+    При doppler=True имитируем удаляющийся источник (эффект Доплера): к концу
+    звука и частота, и громкость быстро снижаются. Фазу накапливаем непрерывно,
+    чтобы снижение частоты звучало плавным «уезжанием».
+    """
+    import math
+    tempo  = 120     # T: четвертей в минуту
+    length = 4       # L: длительность ноты по умолчанию (4 = четверть)
+    octave = 4       # O: текущая октава (для буквенных нот)
+    s = mml.upper()
+    i = 0
+    segs = []        # разобранная последовательность (частота_Гц, длительность_с)
+
+    def read_num():
+        nonlocal i
+        num = ""
+        while i < len(s) and s[i].isdigit():
+            num += s[i]; i += 1
+        return int(num) if num else None
+
+    # ── Разбор строки PLAY в список нот ──────────────────────────────────
+    while i < len(s):
+        ch = s[i]; i += 1
+        if ch.isspace():
+            continue
+        if ch == 'M':                  # MB/MF/ML/MN/MS — режимы, пропускаем
+            if i < len(s): i += 1
+            continue
+        if ch == 'L':
+            v = read_num();  length = v if v else length;  continue
+        if ch == 'T':
+            v = read_num();  tempo  = v if v else tempo;   continue
+        if ch == 'O':
+            v = read_num();  octave = v if v is not None else octave;  continue
+        if ch == 'N':                  # нота по номеру (0 — пауза)
+            note = read_num() or 0
+            segs.append((_play_note_n(note), (60.0 / tempo) * (4.0 / length)))
+            continue
+        if ch == 'P':                  # пауза
+            l = read_num() or length
+            segs.append((0.0, (60.0 / tempo) * (4.0 / l)));  continue
+        if ch in 'ABCDEFG':            # буквенная нота (+/-/# — диез/бемоль)
+            semis = {'C':0,'D':2,'E':4,'F':5,'G':7,'A':9,'B':11}[ch]
+            if i < len(s) and s[i] in '#+': semis += 1; i += 1
+            elif i < len(s) and s[i] == '-': semis -= 1; i += 1
+            l = read_num() or length
+            nn = octave * 12 + semis    # O4,ля(9) -> 57 => 440 Гц
+            segs.append((440.0 * 2.0 ** ((nn - 57) / 12.0), (60.0 / tempo) * (4.0 / l)))
+            continue
+        # неизвестный символ — пропускаем
+
+    # ── Синтез сэмплов ───────────────────────────────────────────────────
+    total = sum(d for _, d in segs) or 0.001
+    rate  = SND_RATE
+    amp0  = 3500 if doppler else 7000   # базовая громкость (с Доплером — тише)
+    buf   = array('h')
+    phase = 0.0      # накопленная фаза меандра
+    t     = 0.0      # время от начала звука
+    for (freq, dur) in segs:
+        n = int(dur * rate)
+        fade = min(120, n // 8)         # сглаживаем края ноты, чтобы не щёлкало
+        for k in range(n):
+            if doppler:
+                tt   = (t + k / rate) / total   # доля пройденного времени 0..1
+                bend = 1.0 - 0.6 * tt           # частота падает примерно до 0.4
+                env  = math.exp(-3.2 * tt)      # громкость быстро спадает
+            else:
+                bend = 1.0; env = 1.0
+            f = freq * bend
+            if f <= 0:
+                v = 0
+            else:
+                phase += 2.0 * math.pi * f / rate
+                v = amp0 if math.sin(phase) >= 0 else -amp0
+                v = int(v * env)
+            if k < fade:
+                v = int(v * k / fade)
+            elif k > n - fade:
+                v = int(v * (n - k) / fade)
+            buf.append(v)
+        t += dur
+
+    try:
+        return pygame.mixer.Sound(buffer=buf.tobytes())
+    except Exception:
+        return None
+
+def play_clear_sound():
+    """Воспроизвести звук удаления ряда (если он построен)."""
+    if _clear_sound is not None:
+        try:
+            _clear_sound.play()
+        except Exception:
+            pass
+
+
+# ── Загрузка спрайтов фигур (встроена, чтобы программа была самодостаточной) ─
+# Имя спрайта для каждой пары (тип_фигуры, индекс_поворота 0-based).
+SPRITE_NAME = {
+    (1, 0): "F1",
+    (2, 0): "F21", (2, 1): "F22", (2, 2): "F23", (2, 3): "F24",
+    (3, 0): "F31", (3, 1): "F32", (3, 2): "F33", (3, 3): "F34",
+    (4, 0): "F41", (4, 1): "F42",
+    (5, 0): "F51", (5, 1): "F52", (5, 2): "F53", (5, 3): "F54",
+    (6, 0): "F6",
+}
+_REF_DIR = resource_path("sprites_ref")
+_DAT     = resource_path("SPHERIX.DAT")
+
+# Палитра EGA (16 цветов) — для запасного декодера из SPHERIX.DAT.
+_EGA_PAL = [
+    (  0,   0,   0), (  0,   0, 170), (  0, 170,   0), (  0, 170, 170),
+    (170,   0,   0), (170,   0, 170), (170,  85,   0), (170, 170, 170),
+    ( 85,  85,  85), ( 85,  85, 255), ( 85, 255,  85), ( 85, 255, 255),
+    (255,  85,  85), (255,  85, 255), (255, 255,  85), (255, 255, 255),
+]
+
+# (Десктопные загрузчики спрайтов из PIL/SPHERIX.DAT удалены из браузерной версии:
+#  спрайты запечены в assets/*.png, Pillow в браузере не нужен.)
+
+def load_sprites(cell_w, cell_h):
+    """Браузерная версия: грузим ЗАПЕЧЁННЫЕ спрайты из assets/sprite_*.png
+    (готовые 2×клетка, без PIL и SPHERIX.DAT — они подготовлены на десктопе)."""
+    surfs = {}
+    for name in set(SPRITE_NAME.values()):
+        path = resource_path(os.path.join("assets", "sprite_%s.png" % name))
+        if os.path.exists(path):
+            surfs[name] = pygame.image.load(path).convert_alpha()
+    return surfs
+
+
+# ── Отрисовка ────────────────────────────────────────────────────────────
+_sprites = {}        # словарь спрайтов фигур, заполняется в init_sprites()
+_bottom_surf = None  # готовый спрайт рельефа дна, строится в init_sprites()
+
+def init_sprites():
+    """Загрузить спрайты фигур (из sprites_ref/ или, при сбое, из SPHERIX.DAT)
+    и построить спрайт рельефа дна из ref_bottom_new.png."""
+    try:
+        loaded = load_sprites(COL_W, ROW_H)
+        _sprites.clear()
+        _sprites.update(loaded)
+    except Exception:
+        # Если спрайты не загрузились — игра нарисует фигуры цветными блоками.
+        pass
+    # Спрайт дна строим отдельно: ошибка здесь не должна ломать загрузку фигур.
+    try:
+        _build_bottom_surface()
+    except Exception:
+        pass
+
+def _build_bottom_surface():
+    """Браузерная версия: грузим ЗАПЕЧЁННЫЙ рельеф дна из assets/bottom.png
+    (уже вырезан/перекрашен/отмасштабирован на десктопе, без PIL)."""
+    global _bottom_surf
+    path = resource_path(os.path.join("assets", "bottom.png"))
+    if os.path.exists(path):
+        _bottom_surf = pygame.image.load(path).convert_alpha()
+    else:
+        _bottom_surf = None
+
+def draw_bottom(surf):
+    """Нарисовать рельеф дна.
+
+    Основной путь — вывести готовый спрайт, построенный из ref_bottom.png.
+    Если спрайт не удалось загрузить, рисуем дно процедурно (запасной путь).
+    """
+    if _bottom_surf is not None:
+        # Спрайт рельефа выводим в ряд 1 (дно колодца).
+        y = PLAY_Y + 20 * ROW_H
+        surf.blit(_bottom_surf, (PLAY_X, y))
+        return
+    _draw_bottom_procedural(surf)
+
+def _draw_bottom_procedural(surf):
+    """Запасная процедурная отрисовка дна по значениям BOTTOM_PATTERN.
+
+    Каждой колонке ряда 1 соответствует дуга, форма которой задана кодом k2:
+        5 = выпуклость вправо  → дуга нижнего-левого квадранта;
+        6 = выпуклость влево   → дуга нижнего-правого квадранта;
+        7 = вогнутость вправо  → дуга верхнего-левого квадранта;
+        8 = вогнутость влево   → дуга верхнего-правого квадранта.
+    """
+    import math
+    # Пиксельные координаты и размеры ряда 1 (дна).
+    by = PLAY_Y + 20 * ROW_H          # Y верхнего края ряда 1
+    bh = ROW_H                         # высота ряда
+    bw = COL_W                         # ширина одной колонки
+    arc_color = (180, 100, 60)         # тёплый коричневый, как на эталоне
+    bg_color  = (20, 20, 20)           # фон ячейки дна
+
+    for c in range(1, GRID_COLS + 1):
+        val = BOTTOM_PATTERN[c]
+        bx = PLAY_X + (c - 1) * bw
+        # Заливаем ячейку фоном.
+        rect = pygame.Rect(bx, by, bw, bh)
+        pygame.draw.rect(surf, bg_color, rect)
+
+        # Прямоугольник дуги шириной в 2 колонки, центрированный по границе ячейки.
+        arc_rect = pygame.Rect(bx - bw // 2, by - bh, bw * 2, bh * 2)
+
+        if val == 5:   # выпуклость вправо: нижний-левый квадрант (180°–270°)
+            pygame.draw.arc(surf, arc_color, arc_rect, math.pi, 3*math.pi/2, max(1, bh//2))
+            # заливаем треугольником сам квадрант
+            pygame.draw.polygon(surf, arc_color, [
+                (bx, by + bh),
+                (bx + bw//2, by + bh),
+                (bx, by + bh//2),
+            ])
+        elif val == 6: # выпуклость влево: нижний-правый квадрант (270°–360°)
+            arc_rect2 = pygame.Rect(bx - bw // 2, by - bh, bw * 2, bh * 2)
+            pygame.draw.arc(surf, arc_color, arc_rect2, 3*math.pi/2, 2*math.pi, max(1, bh//2))
+            pygame.draw.polygon(surf, arc_color, [
+                (bx + bw, by + bh),
+                (bx + bw//2, by + bh),
+                (bx + bw, by + bh//2),
+            ])
+        elif val == 7: # вогнутость вправо: вогнутая дуга, открытая вправо
+            pygame.draw.arc(surf, arc_color, arc_rect,
+                            math.pi, 3*math.pi/2, max(1, bh//3))
+        elif val == 8: # вогнутость влево: вогнутая дуга, открытая влево
+            pygame.draw.arc(surf, arc_color, arc_rect,
+                            3*math.pi/2, 2*math.pi, max(1, bh//3))
+
+def piece_screen_pos(col, row):
+    """Экранные (x, y) левого-верхнего угла фигуры 2×2, верхний ряд которой = row."""
+    x = PLAY_X + (col - 1) * COL_W
+    y = PLAY_Y + (21 - row) * ROW_H   # row — это ВЕРХНИЙ ряд фигуры 2×2
+    return x, y
+
+def blit_sprite(surf, name, col, row):
+    """Вывести спрайт `name` в позицию поля (col, верхний_ряд = row)."""
+    if name in _sprites:
+        x, y = piece_screen_pos(col, row)
+        surf.blit(_sprites[name], (x, y))
+
+def cell_rect(col, row):
+    """pygame.Rect одной клетки поля (col c 1, row: 1=дно … 21=верх)."""
+    x = PLAY_X + (col - 1) * COL_W
+    y = PLAY_Y + (21 - row) * ROW_H
+    return pygame.Rect(x, y, COL_W, ROW_H)
+
+def _sprite_name(fig, idx):
+    """Имя спрайта для (номер_фигуры, индекс_поворота)."""
+    return SPRITE_NAME.get((fig, idx), None)
+
+# Угол клетки, в котором центрируется четверть эллипса для каждого кода ms.
+# Выпуклые коды (1,2,5,6) рисуются как залитая четвертинка у этого угла,
+# вогнутые (3,4,7,8) — как клетка МИНУС четвертинка у того же угла, что и
+# у их пары по сумме=9 (1+8, 2+7, 3+6, 4+5) — так пара заполняет клетку целиком.
+# Углы: 0=левый-верх, 1=правый-верх, 2=левый-низ, 3=правый-низ.
+_ARC_CORNER = {1: 0, 2: 1, 5: 2, 6: 3,      # выпуклые
+               8: 0, 7: 1, 4: 2, 3: 3}      # вогнутые (тот же угол, что у пары)
+_ARC_CONVEX = {1, 2, 5, 6}
+
+def _draw_arc_cell(surf, rect, value, color):
+    """Нарисовать четвертинку-дугу кода value в клетке rect цветом color.
+
+    Выпуклый код — залитая четверть эллипса у нужного угла клетки;
+    вогнутый — клетка без этой четверти (как «откушенный» угол).
+    """
+    w, h = rect.w, rect.h
+    corner = _ARC_CORNER[value]
+    # Пиксельные координаты выбранного угла в локальных координатах клетки.
+    kx = 0 if corner in (0, 2) else w
+    ky = 0 if corner in (0, 1) else h
+    # Габарит эллипса вдвое больше клетки и центрирован в этом углу, поэтому
+    # внутрь клетки попадает ровно одна его четверть.
+    ebox = pygame.Rect(kx - w, ky - h, 2 * w, 2 * h)
+
+    cell = pygame.Surface((w, h), pygame.SRCALPHA)
+    if value in _ARC_CONVEX:
+        # Выпуклость: просто заливаем четверть эллипса.
+        pygame.draw.ellipse(cell, color, ebox)
+    else:
+        # Вогнутость: заливаем клетку и «вырезаем» четверть эллипса (alpha→0).
+        cell.fill(color)
+        mask = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.ellipse(mask, (255, 255, 255, 255), ebox)
+        cell.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
+    surf.blit(cell, (rect.x, rect.y))
+
+def draw_grid(surf, game):
+    """Нарисовать поле: рамку, осевший колодец и текущую падающую фигуру.
+
+    Осевший колодец (рельеф дна + все остановившиеся фигуры и достройки)
+    хранится готовым изображением game.well — выводим его одним блитом.
+    Падающую фигуру рисуем спрайтом поверх.
+    """
+    # Белая рамка игрового стакана.
+    border = pygame.Rect(PLAY_X - 2, PLAY_Y - 2,
+                         GRID_COLS * COL_W + 4, 21 * ROW_H + 4)
+    pygame.draw.rect(surf, WHITE, border, 2)
+
+    # Готовое изображение осевшего колодца.
+    if game.well is not None:
+        surf.blit(game.well, (PLAY_X, PLAY_Y))
+    else:
+        # Запасной путь (если изображение колодца не создано): рельеф дна.
+        draw_bottom(surf)
+
+    # Текущая падающая фигура поверх колодца.
+    if _sprites:
+        name = _sprite_name(game.fig, game._rot_idx())
+        if name:
+            blit_sprite(surf, name, game.col, game.row)
+    else:
+        # Без спрайтов рисуем падающую фигуру цветным блоком 2×2.
+        rect = cell_rect(game.col, game.row)
+        pygame.draw.rect(surf, FIG_COLOR.get(game.fig, WHITE),
+                         pygame.Rect(rect.x, rect.y, COL_W * 2, ROW_H * 2))
+
+def draw_panel(surf, font, game):
+    """Нарисовать правую панель: уровень, число линий и счёт."""
+    x, y = RIGHT_X + 8, PLAY_Y
+    # По одной плашке на каждый показатель.
+    for label, val in [("LEVEL", game.level),
+                       ("LINES", game.lines),
+                       ("SCORE", int(game.score))]:
+        pygame.draw.rect(surf, BLUE, (x, y, RIGHT_W - 16, 64))
+        pygame.draw.rect(surf, WHITE, (x, y, RIGHT_W - 16, 64), 1)
+        surf.blit(font.render(label, True, LCYAN), (x + 8, y + 4))
+        surf.blit(font.render(str(val), True, WHITE), (x + 8, y + 34))
+        y += 72
+    # Подпись об авторе под панелью счёта (по центру, крупным читаемым шрифтом,
+    # ровно в 2 строки: «Game by» / «Skudarnov I, 1991»).
+    pw = RIGHT_W - 16
+    cf, lines = _get_credit(pw)
+    for i, line in enumerate(lines):
+        t = cf.render(line, True, LGRAY)
+        surf.blit(t, (x + (pw - t.get_width()) // 2, y + 6 + i * (cf.get_height() + 2)))
+
+def draw_sidebar(surf, font):
+    """Нарисовать левую панель с раскладкой управляющих клавиш."""
+    keys = ["4 : Left", "6 : Right", "5 : Rotate",
+            "Spc:Drop", "7 : Sound", "1 : Next",
+            "+  : Level", "8 : Pause", "Esc: Quit"]
+    pygame.draw.rect(surf, BLUE, (4, PLAY_Y, SIDEBAR_W - 8, len(keys)*22 + 8))
+    pygame.draw.rect(surf, WHITE, (4, PLAY_Y, SIDEBAR_W - 8, len(keys)*22 + 8), 1)
+    for i, k in enumerate(keys):
+        surf.blit(font.render(k, True, WHITE), (10, PLAY_Y + 4 + i * 22))
+
+def draw_next(surf, font, game):
+    """Нарисовать окно «следующая фигура», если включён показ (клавиша 1)."""
+    if not game.show_next:
+        return
+    # Окно подняли ещё выше и сделали выше по высоте, чтобы спрайт фигуры
+    # (80×64) располагался по центру окна под надписью NEXT.
+    w, h = SIDEBAR_W - 8, 116
+    x, y = 4, SCREEN_H - 130
+    pygame.draw.rect(surf, BLUE, (x, y, w, h))
+    pygame.draw.rect(surf, WHITE, (x, y, w, h), 1)
+    surf.blit(font.render("NEXT", True, YELLOW), (x + 8, y + 6))
+    # Рисуем следующую фигуру её настоящим спрайтом (поворот R0), по центру
+    # области под надписью (от y+24 до низа окна).
+    name = _sprite_name(game.next_fig, 0)
+    if _sprites and name in _sprites:
+        spr = _sprites[name]
+        sx_ = x + (w - spr.get_width()) // 2
+        sy_ = y + 24 + ((h - 24) - spr.get_height()) // 2
+        surf.blit(spr, (sx_, sy_))
+    else:
+        # Запасной путь без спрайтов — однотонный блок 2×2.
+        color = FIG_COLOR.get(game.next_fig, WHITE)
+        r = pygame.Rect(x + (w - COL_W * 2) // 2, y + 28, COL_W * 2, ROW_H * 2)
+        pygame.draw.rect(surf, color, r)
+        pygame.draw.rect(surf, DGRAY, r, 1)
+
+_msg_font = None     # крупный шрифт для надписей PAUSE / GAME OVER (ленивая загрузка)
+_small_font = None   # мелкий шрифт для подписи автора и надписи-поздравления
+
+def _get_msg_font():
+    """Крупный шрифт (~3× обычного) для центральных надписей."""
+    global _msg_font
+    if _msg_font is None:
+        _msg_font = pygame.font.SysFont("Courier New", 48, bold=True)
+    return _msg_font
+
+def _get_small_font():
+    """Мелкий шрифт для подписи автора и надписи о замене фигуры."""
+    global _small_font
+    if _small_font is None:
+        _small_font = pygame.font.SysFont("Courier New", 13, bold=True)
+    return _small_font
+
+_credit_cache = None  # кэш (шрифт, строки) для подписи автора
+
+def _get_credit(pw):
+    """Подпись автора ровно в 2 строки: «Game by» / «Skudarnov I, 1991».
+    Подбираем максимальный кегль, при котором длинная строка влезает в ширину pw."""
+    global _credit_cache
+    if _credit_cache is None:
+        lines = ["Game by", "Skudarnov I, 1991"]
+        size = 24
+        while size > 11:
+            f = load_font(size)
+            if max(f.size(s)[0] for s in lines) <= pw:
+                break
+            size -= 1
+        _credit_cache = (f, lines)
+    return _credit_cache
+
+def _wrap_text(text, font, max_w):
+    """Разбить строку на строки, помещающиеся по ширине max_w (по словам)."""
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if font.size(test)[0] <= max_w or not cur:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+def draw_replace_msg(surf, game):
+    """Надпись-поздравление над окном Next, если фигуру из Next заменил фильтр.
+
+    Показывается только при включённом показе Next (клавиша 1). Исчезает при
+    любом нажатии клавиши (тогда же начисляется +1 очко — см. run_game).
+    """
+    if not (game.replaced and game.show_next):
+        return
+    f = _get_small_font()
+    text = ("Congratulations! You've successfully replaced "
+            "the next piece, earning +1 point!")
+    w = SIDEBAR_W - 8
+    lines = _wrap_text(text, f, w - 12)
+    lh = f.get_height() + 2
+    box_h = lh * len(lines) + 10
+    x = 4
+    y = (SCREEN_H - 130) - box_h - 6     # прямо над окном Next
+    pygame.draw.rect(surf, BLUE, (x, y, w, box_h))
+    pygame.draw.rect(surf, LGREEN, (x, y, w, box_h), 1)
+    yy = y + 5
+    for ln in lines:
+        surf.blit(f.render(ln, True, LGREEN), (x + 6, yy))
+        yy += lh
+
+def draw_center_message(surf, msg, color):
+    """Вывести надпись крупным шрифтом в окошке по центру экрана.
+
+    Окошко (чёрный фон + рамка цветом надписи) нужно, чтобы текст не сливался
+    с фигурами в колодце.
+    """
+    big = _get_msg_font()
+    txt = big.render(msg, True, color)
+    pad = 24
+    bw, bh = txt.get_width() + pad * 2, txt.get_height() + pad * 2
+    bx, by = (SCREEN_W - bw) // 2, (SCREEN_H - bh) // 2
+    pygame.draw.rect(surf, BLACK, (bx, by, bw, bh))
+    pygame.draw.rect(surf, color, (bx, by, bw, bh), 3)
+    surf.blit(txt, (bx + pad, by + pad))
+
+def redraw(surf, font, game, msg=None):
+    """Полностью перерисовать кадр: фон, панели, поле и (опц.) сообщение."""
+    surf.fill(BLACK)
+    draw_sidebar(surf, font)
+    draw_grid(surf, game)
+    draw_panel(surf, font, game)
+    draw_next(surf, font, game)
+    draw_replace_msg(surf, game)
+    # Центрированное сообщение в окошке: GAME OVER — ярко-красным, PAUSE — жёлтым.
+    if msg:
+        color = LRED if game.over else YELLOW
+        draw_center_message(surf, msg, color)
+    pygame.display.flip()
+
+
+# ── Вспомогательные экраны интерфейса ────────────────────────────────────
+async def wait_key():
+    """Ждать нажатия клавиши или закрытия окна. Неблокирующий опрос событий с
+    отдачей управления браузеру (pygbag), вместо блокирующего event.wait()."""
     while True:
         for ev in pygame.event.get():
             if ev.type in (pygame.KEYDOWN, pygame.QUIT):
                 return ev
         await asyncio.sleep(0)
 
-
-def _draw_slider(surf, font, think):
-    """Слайдер 0–30 секунд с метками и треугольным указателем на think."""
-    x0, x1 = (SCREEN_W - 360) // 2, (SCREEN_W - 360) // 2 + 360
-    y = 360
-    pygame.draw.line(surf, WHITE, (x0, y), (x1, y), 2)
-    for v in range(0, 31, 5):
-        x = x0 + v / 30 * 360
-        pygame.draw.line(surf, WHITE, (x, y - 7), (x, y + 7), 2)
-        lbl = font.render(str(v), True, WHITE)
-        surf.blit(lbl, (x - lbl.get_width() // 2, y - 30))
-    # треугольный указатель под линией
-    mx = x0 + think / 30 * 360
-    pygame.draw.polygon(surf, UI_YELLOW,
-                        [(mx, y + 10), (mx - 7, y + 22), (mx + 7, y + 22)])
-    val = font.render("( 0 = no limit )", True, UI_YELLOW)
-    surf.blit(val, ((SCREEN_W - val.get_width()) // 2, y + 30))
-
-
-def _draw_start(surf, font, big, types, level, think, step):
-    """Стартовый экран ПОШАГОВО: показываем только отвеченные вопросы и текущий."""
+async def show_scores(surf, font, big, scores):
+    """Показать таблицу рекордов и ждать нажатия любой клавиши."""
     surf.fill(BLACK)
-    x = 70
-    title = big.render("F I L L E R _ h e x", True, COLORS[1])
-    surf.blit(title, ((SCREEN_W - title.get_width()) // 2, 14))
+    t = big.render("T E N   T O P", True, YELLOW)
+    surf.blit(t, ((SCREEN_W - t.get_width()) // 2, 40))
+    # Десять строк рекордов.
+    for i, e in enumerate(scores):
+        line = f"{i+1:2}. {e['name']}  lines:{e['lines']:5}  score:{e['score']:7}"
+        surf.blit(font.render(line, True, WHITE), (80, 100 + i * 26))
+    pygame.display.flip()
+    pygame.event.clear()   # сбрасываем «старые» события, чтобы реагировать сразу
+    await wait_key()
 
-    def line(text, yy, color):
-        surf.blit(font.render(text, True, color), (x, yy))
+async def choose_level(surf, font, big):
+    """Выбрать уровень 0-9. Нажатие цифры сразу запускает игру.
 
-    def ptype(t, ctrl):
-        return "" if t is None else ("   <- human (%s)" % ctrl if t == 'H'
-                                     else "   <- computer (IBM PC)")
-
-    # Вопрос 1 — первый игрок (показывается всегда).
-    line("Choose I  Player :  Z,X,C - 1  ,  IBM PC - 2" + ptype(types[0], "z,x,c"),
-         90, UI_YELLOW if step == 0 else UI_GREEN)
-    # Вопрос 2 — второй игрок (после ответа на 1-й).
-    if step >= 1:
-        line("Choose II Player :  1,2,3 - 1  ,  IBM PC - 2" + ptype(types[1], "1,2,3"),
-             130, UI_YELLOW if step == 1 else UI_GREEN)
-    # Вопрос 3 — уровень (только если есть компьютер).
-    if 'C' in types and step >= 2:
-        names = {1: "Beginner", 2: "Expert", 3: "Master"}
-        sel = ("   <- " + names[level]) if level else ""
-        line("Choose level :  Beginner - 1 ,  Expert - 2 ,  Master - 3" + sel,
-             185, UI_YELLOW if step == 2 else UI_GREEN)
-    # Вопрос 4 — время на ход (шкала).
-    if step >= 3:
-        line("Enter amount of seconds for thinking :", 300, UI_YELLOW)
-        _draw_slider(surf, font, think)
-
-
-async def start_screen(surf, font, big):
-    """Стартовый экран. Возвращает настройки {types,level,think} или None (выход)."""
-    types = [None, None]      # 'H' человек / 'C' компьютер
-    level = None              # 1/2/3 (None, если оба люди)
-    think = 15                # секунд на ход (0 — без лимита)
-    step = 0                  # 0 PlayerI, 1 PlayerII, 2 level, 3 слайдер
-    NUM1 = (pygame.K_1, pygame.K_KP1)
-    NUM2 = (pygame.K_2, pygame.K_KP2)
-    NUM3 = (pygame.K_3, pygame.K_KP3)
+    Возвращает выбранный уровень, либо None при выходе (Esc/закрытие окна).
+    """
+    surf.fill(BLACK)
+    surf.blit(big.render("S P H E R I X", True, LCYAN),
+              ((SCREEN_W - big.size("S P H E R I X")[0]) // 2, 60))
+    surf.blit(font.render("Enter level (0 - 9):", True, WHITE),
+              (SCREEN_W // 2 - 110, SCREEN_H // 2))
+    pygame.display.flip()
+    pygame.event.clear()   # сбрасываем «старые» события, чтобы реагировать сразу
+    # Ждём цифру (старт) либо Esc/закрытие (выход).
     while True:
-        _draw_start(surf, font, big, types, level, think, step)
-        pygame.display.flip()
         ev = await wait_key()
         if ev.type == pygame.QUIT:
             return None
         k = ev.key
+        if pygame.K_0 <= k <= pygame.K_9:
+            return k - pygame.K_0   # цифра нажата → запускаем сразу
         if k == pygame.K_ESCAPE:
             return None
-        if step == 0:
-            if k in NUM1: types[0] = 'H'; step = 1
-            elif k in NUM2: types[0] = 'C'; step = 1
-        elif step == 1:
-            if k in NUM1: types[1] = 'H'
-            elif k in NUM2: types[1] = 'C'
-            else: continue
-            step = 2 if 'C' in types else 3   # уровень — только если есть компьютер
-        elif step == 2:
-            if k in NUM1: level = 1; step = 3
-            elif k in NUM2: level = 2; step = 3
-            elif k in NUM3: level = 3; step = 3
-        elif step == 3:
-            if k == pygame.K_LEFT:  think = max(0, think - 1)
-            elif k == pygame.K_RIGHT: think = min(30, think + 1)
-            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                return {"types": types, "level": level, "think": think}
-
-
-# ── Звук ─────────────────────────────────────────────────────────────────
-# Синтез тонов в буфер (без numpy — работает и в браузере pygbag).
-SND_RATE   = 22050
-SOUND_OK   = False
-_move_cache = {}
-_snd_win_h = None       # фанфары (победа человека)
-_snd_win_c = None       # «смешок» (победа компьютера)
-
-# Победные мелодии: список (частота_Гц, длительность_с); частота 0 — пауза.
-FANFARE = [(392,0.16),(523,0.16),(659,0.16),(784,0.30),(0,0.05),
-           (659,0.15),(784,0.42),(0,0.04),(1047,0.55)]            # ~2.2 c, ввысь
-CHUCKLE = [(466,0.10),(0,0.06),(440,0.10),(0,0.06),(392,0.10),(0,0.06),
-           (349,0.11),(0,0.07),(311,0.12),(0,0.08),(262,0.14),(0,0.10),
-           (220,0.18),(0,0.06),(175,0.34)]                        # ~1.7 c, вниз
-
-def _make_buffer(segments, vol):
-    """Собрать 16-битный моно-буфер из сегментов (синус, с фейдами по краям)."""
-    buf = array('h')
-    amp = int(9000 * vol)               # все звуки негромкие
-    for freq, dur in segments:
-        n = int(dur * SND_RATE)
-        fade = min(220, max(1, n // 6))
-        two_pi_f = 2.0 * math.pi * freq / SND_RATE
-        for i in range(n):
-            v = 0 if freq <= 0 else int(amp * math.sin(two_pi_f * i))
-            if i < fade:
-                v = v * i // fade
-            elif i > n - fade:
-                v = v * (n - i) // fade
-            buf.append(v)
-    return buf
-
-def make_sound(segments, vol):
-    try:
-        return pygame.mixer.Sound(buffer=_make_buffer(segments, vol).tobytes())
-    except Exception:
-        return None
-
-def init_sound():
-    """Инициализировать микшер и собрать победные мелодии. Без звука игра тоже идёт."""
-    global SOUND_OK, _snd_win_h, _snd_win_c
-    try:
-        pygame.mixer.init()             # параметры заданы pre_init() в main()
-        SOUND_OK = True
-    except Exception:
-        SOUND_OK = False
-        return
-    _snd_win_h = make_sound(FANFARE, 0.30)
-    _snd_win_c = make_sound(CHUCKLE, 0.30)
-
-def move_sound(gain):
-    """Звук хода: чем больше присоединено гексов, тем НИЖЕ и ДЛИННЕЕ тон."""
-    if not SOUND_OK or gain <= 0:
-        return None
-    g = min(gain, 40)
-    if g not in _move_cache:
-        freq = max(120, 520 - g * 12)
-        dur  = min(0.50, 0.10 + g * 0.011)
-        _move_cache[g] = make_sound([(freq, dur)], 0.22)
-    return _move_cache[g]
-
-def play(snd):
-    if snd is not None:
-        try:
-            snd.play()
-        except Exception:
-            pass
-
-
-# ── Игровой цикл, конец игры, Play again ─────────────────────────────────
-WIN_SCORE     = COLS * ROWS // 2   # 224: победа при счёте СТРОГО больше
-COMP_DELAY_MS = 600                # пауза перед ходом компьютера (чтобы было видно)
-
-def _winner(game, no_progress):
-    """Победитель (0/1) или None. Победа при счёте > WIN_SCORE; иначе при
-    заполнении поля / отсутствии прогресса — у кого больше очков."""
-    if game.score[0] > WIN_SCORE:
-        return 0
-    if game.score[1] > WIN_SCORE:
-        return 1
-    if sum(game.score) >= COLS * ROWS or no_progress >= 4:
-        if game.score[0] == game.score[1]:
-            return 'draw'                       # ничья (напр. 224 : 224)
-        return 0 if game.score[0] > game.score[1] else 1
-    return None
-
-
-async def run_game(game, surf, font, clock):
-    """Провести партию. Возвращает индекс победителя (0/1) или 'quit'."""
-    types = game.settings["types"]
-    level = game.settings["level"]
-    think = game.settings["think"]
-    turn_start = pygame.time.get_ticks()
-    prev_total = sum(game.score)
-    no_progress = 0
-
-    def done(mover):
-        """Завершить ход mover: передать очередь, обновить таймеры/прогресс.
-        Вернуть победителя или None."""
-        nonlocal turn_start, prev_total, no_progress
-        game.turn = 1 - mover
-        game.reset_marker_left(game.turn)        # маркер нового игрока — крайний левый доступный
-        turn_start = pygame.time.get_ticks()
-        total = sum(game.score)
-        if total == prev_total:
-            no_progress += 1
-        else:
-            no_progress = 0
-            prev_total = total
-        return _winner(game, no_progress)
-
-    while True:
-        clock.tick(30)
-        now = pygame.time.get_ticks()
-        cur = game.turn
-        is_human = (types[cur] == 'H')
-
-        # ── ввод (люди + выход) ──
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                return 'quit'
-            if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
-                    return 'quit'
-                if is_human:
-                    before = game.score[cur]
-                    if handle_key(game, ev.key):            # сделан ход
-                        play(move_sound(game.score[cur] - before))
-                        w = done(cur)
-                        if w is not None:
-                            return w
-                        break   # ход сделан — остальные события кадра не трогаем
-
-        # ── ход компьютера (после паузы) ──
-        if not is_human and now - turn_start >= COMP_DELAY_MS:
-            col = ai_choose(game, cur, level)
-            before = game.score[cur]
-            if col is not None:
-                game.marker[cur] = col          # показать выбранный цвет
-                game.apply_move(cur, col)
-            play(move_sound(game.score[cur] - before))
-            w = done(cur)
-            if w is not None:
-                return w
-        # ── тайм-аут человека: авто-ход цветом под маркером ──
-        elif is_human and think > 0 and now - turn_start >= think * 1000:
-            before = game.score[cur]
-            game.apply_move(cur, game.marker[cur])
-            play(move_sound(game.score[cur] - before))
-            w = done(cur)
-            if w is not None:
-                return w
-
-        # ── отрисовка с обратным отсчётом ──
-        remain = None
-        if is_human and think > 0:
-            remain = max(0, think - (now - turn_start) // 1000)
-        redraw(surf, font, game, remain)
-        pygame.display.flip()
-        await asyncio.sleep(0)          # отдать управление браузеру (pygbag)
-
-
-async def wave_fill(game, surf, font, winner, clock):
-    """Победная заливка: всё поле окрашивается цветом победного хода волной по
-    столбцам — слева направо (P1) или справа налево (P2), ~0.05 с/столбец."""
-    color = game.cur_color[winner]
-    # фанфары при победе человека, «издевательский смешок» при победе компьютера
-    if game.settings["types"][winner] == 'H':
-        play(_snd_win_h)
-    else:
-        play(_snd_win_c)
-    cols = range(COLS) if winner == 0 else range(COLS - 1, -1, -1)
-    for col in cols:
-        for row in range(ROWS):
-            game.color[col][row] = color
-            game.owner[col][row] = winner
-        # счёт НЕ пересчитываем: в углах остаются итоговые очки партии.
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                return
-        redraw(surf, font, game)
-        pygame.display.flip()
-        await asyncio.sleep(0.05)       # ~0.05 c между столбцами (неблокирующе)
-
-
-async def show_draw(game, surf, font, big, clock):
-    """Окно с МИГАЮЩЕЙ надписью «Drawn!» по центру: ~2 с или до нажатия клавиши
-    (по более раннему событию). Поле под окном остаётся (итоговое 224:224)."""
-    start = pygame.time.get_ticks()
-    while True:
-        now = pygame.time.get_ticks()
-        if now - start >= 2000:
-            return
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT or ev.type == pygame.KEYDOWN:
-                return
-        redraw(surf, font, game)                      # застывшее поле
-        if ((now - start) // 400) % 2 == 0:           # мигание ~каждые 0.4 с
-            msg = big.render("Drawn !", True, UI_YELLOW)
-            pad = 28
-            bw, bh = msg.get_width() + pad * 2, msg.get_height() + pad * 2
-            bx, by = (SCREEN_W - bw) // 2, (SCREEN_H - bh) // 2
-            pygame.draw.rect(surf, BLACK, (bx, by, bw, bh))
-            pygame.draw.rect(surf, UI_YELLOW, (bx, by, bw, bh), 2)
-            surf.blit(msg, (bx + pad, by + pad))
-        pygame.display.flip()
-        clock.tick(30)
-        await asyncio.sleep(0)
-
 
 async def ask_again(surf, font):
-    """Спросить «Play again? (Y/N)». True — да (Y), False — нет (N/Esc/закрытие)."""
-    msg = font.render("Play again ?    ( Y / N )", True, UI_YELLOW)
-    pad = 24
-    bw, bh = msg.get_width() + pad * 2, msg.get_height() + pad * 2
-    bx, by = (SCREEN_W - bw) // 2, (SCREEN_H - bh) // 2
-    pygame.draw.rect(surf, BLACK, (bx, by, bw, bh))
-    pygame.draw.rect(surf, UI_YELLOW, (bx, by, bw, bh), 2)
-    surf.blit(msg, (bx + pad, by + pad))
+    """Спросить «играть снова?»; вернуть True (Y) или False (N/Esc/закрытие)."""
+    surf.fill(BLACK)
+    surf.blit(font.render("Play again?  Y / N", True, YELLOW),
+              ((SCREEN_W - font.size("Play again?  Y / N")[0]) // 2, SCREEN_H // 2))
     pygame.display.flip()
+    pygame.event.clear()   # сбрасываем «старые» события, чтобы реагировать сразу
     while True:
         ev = await wait_key()
-        if ev.type == pygame.QUIT:
-            return False
-        if ev.key == pygame.K_y:
-            return True
-        if ev.key in (pygame.K_n, pygame.K_ESCAPE):
-            return False
+        if ev.type == pygame.QUIT:           return False
+        if ev.key in (pygame.K_y,):          return True
+        if ev.key in (pygame.K_n, pygame.K_ESCAPE): return False
+
+async def enter_initials(surf, font):
+    """Ввести инициалы (до 3 символов) для новой рекордной записи."""
+    name = ""
+    pygame.event.clear()   # сбрасываем «старые» события (иначе попадут в имя)
+    while True:
+        # Перерисовываем строку ввода с текущими инициалами и курсором «_».
+        surf.fill(BLACK)
+        surf.blit(font.render("New record!  Enter initials: " + name + "_", True, YELLOW),
+                  (60, SCREEN_H // 2))
+        pygame.display.flip()
+        # Обрабатываем ввод символов.
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return "   "
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_RETURN:
+                    return (name + "   ")[:3]          # дополняем до 3 символов
+                elif ev.key == pygame.K_BACKSPACE:
+                    name = name[:-1]                    # стираем последний
+                elif len(name) < 3 and ev.unicode.isprintable() and ev.unicode.strip():
+                    name += ev.unicode.upper()          # добавляем символ
+        await asyncio.sleep(0)                          # отдать управление браузеру
+
+
+# ── Главный игровой цикл одной партии ────────────────────────────────────
+async def run_game(level, surf, font, clock):
+    """Провести одну партию. Вернуть (game, 'quit' | 'game_over')."""
+    game = Game(level)
+    paused = False
+
+    while True:
+        # Время, прошедшее с прошлого кадра (для таймера падения).
+        dt = clock.tick(FPS) / 1000.0
+
+        # ── Обработка ввода ──────────────────────────────────────────────
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return game, 'quit'
+            if ev.type != pygame.KEYDOWN:
+                continue
+            k = ev.key
+            # Любое нажатие убирает надпись о замене фигуры и даёт +1 очко.
+            if game.replaced:
+                game.replaced = False
+                game.score += 1
+            # Esc — выход из партии в любой момент.
+            if k == pygame.K_ESCAPE:
+                return game, 'quit'
+            # На паузе реагируем только на повторное нажатие 8 (снять паузу).
+            if paused:
+                if k == pygame.K_8:
+                    paused = False
+                continue
+            # После конца игры ввод движений игнорируем.
+            if game.over:
+                continue
+
+            # Управление фигурой и игровыми режимами.
+            if k in (pygame.K_4, pygame.K_KP4):
+                game.move_left()
+            elif k in (pygame.K_6, pygame.K_KP6):
+                game.move_right()
+            elif k in (pygame.K_5, pygame.K_KP5):
+                game.rotate()
+            elif k == pygame.K_SPACE:
+                game.hard_drop()
+            elif k == pygame.K_7:
+                game.sound = not game.sound
+            elif k == pygame.K_1:
+                game.show_next = not game.show_next
+            elif k in (pygame.K_PLUS, pygame.K_KP_PLUS, pygame.K_EQUALS):
+                if game.level < 9:
+                    game.level += 1
+            elif k == pygame.K_8:
+                paused = True
+
+        # ── Автоматическое падение / пауза приземления ───────────────────
+        if not paused and not game.over:
+            if game.touch_down():
+                # Фигура достигла опоры — не фиксируем сразу, а выдерживаем
+                # паузу LAND_PAUSE, в течение которой её ещё можно сдвинуть
+                # вбок (клавиши 4/6). По истечении паузы — приземляем.
+                game.drop_t = 0.0
+                game.land_t += dt
+                if game.land_t >= LAND_PAUSE:
+                    game.land_t = 0.0
+                    game.land()
+                    game.check_clear()
+                    game.try_level_up()
+                    if game.is_topped():
+                        game.over = True
+                    else:
+                        game.spawn_next()
+            else:
+                # Фигура может падать дальше (в т.ч. если её сдвинули вбок и
+                # под ней снова открылось место) — сбрасываем паузу приземления.
+                game.land_t = 0.0
+                game.drop_t += dt
+                if game.drop_t >= LEVEL_DELAY[game.level]:
+                    game.drop_t = 0.0
+                    game.row -= 1
+
+        # ── Отрисовка кадра ──────────────────────────────────────────────
+        msg = "P A U S E" if paused else ("G A M E  O V E R" if game.over else None)
+        redraw(surf, font, game, msg)
+        await asyncio.sleep(0)     # отдать управление браузеру (pygbag)
+
+        # По окончании игры ждём клавишу и завершаем партию.
+        if game.over:
+            pygame.event.clear()   # сбрасываем накопленные за игру события
+            await wait_key()
+            return game, 'game_over'
+
+    return game, 'game_over'
 
 
 # ── Точка входа ──────────────────────────────────────────────────────────
 def load_font(size):
     """Шрифт интерфейса. В браузере (pygbag, sys.platform=='emscripten') системных
-    шрифтов нет — используем встроенный шрифт pygame. На десктопе — «Courier New»."""
+    шрифтов нет — берём встроенный шрифт pygame. На десктопе — «Courier New»."""
     if sys.platform == "emscripten":
         return pygame.font.Font(None, size)
     try:
@@ -734,12 +1457,12 @@ def load_font(size):
 
 
 async def goodbye(surf, big):
-    """Финальный экран после выхода (N на Play again / Esc на старт-экране):
-    программа завершена. В браузере вкладку не закрыть — показываем сообщение."""
+    """Финальный экран после выхода (N/Esc): программа завершена, новая игра не
+    запускается. В браузере вкладку не закрыть, поэтому показываем сообщение."""
     surf.fill(BLACK)
-    msg = big.render("Thanks for playing !", True, UI_YELLOW)
+    msg = big.render("Thanks for playing !", True, YELLOW)
     surf.blit(msg, ((SCREEN_W - msg.get_width()) // 2, SCREEN_H // 2 - 30))
-    hint = load_font(18).render("Refresh the page (F5) to play again", True, UI_GRAY)
+    hint = load_font(18).render("Refresh the page (F5) to play again", True, LGRAY)
     surf.blit(hint, ((SCREEN_W - hint.get_width()) // 2, SCREEN_H // 2 + 24))
     pygame.display.flip()
     while True:                  # удерживаем экран; новых партий не начинаем
@@ -750,70 +1473,78 @@ async def goodbye(surf, big):
 async def web_stopped(surf, big):
     """На вебе N/Esc не завершают программу (страницу не перезагрузить без
     потери разрешения на звук) — но должна быть чёткая точка «остановки»,
-    а не мгновенный проброс обратно в экран настройки игроков. Показываем
-    финальное сообщение и ждём любую клавишу, чтобы вернуться в меню."""
+    а не мгновенный проброс обратно в меню. Показываем финальное сообщение
+    и ждём любую клавишу, чтобы вернуться в меню."""
     surf.fill(BLACK)
-    msg = big.render("Thanks for playing !", True, UI_YELLOW)
+    msg = big.render("Thanks for playing !", True, YELLOW)
     surf.blit(msg, ((SCREEN_W - msg.get_width()) // 2, SCREEN_H // 2 - 30))
-    hint = load_font(18).render("Press any key to play again", True, UI_GRAY)
+    hint = load_font(18).render("Press any key to play again", True, LGRAY)
     surf.blit(hint, ((SCREEN_W - hint.get_width()) // 2, SCREEN_H // 2 + 24))
     pygame.display.flip()
     await wait_key()
 
 
 async def main():
-    # Микшер: формат задаём ДО pygame.init(); моно 16-бит, 22050 Гц.
+    """Инициализация pygame и внешний цикл: меню → партия → рекорды → повтор."""
+    # Микшер: формат задаём ДО pygame.init() (моно 16-бит).
     try:
         pygame.mixer.pre_init(SND_RATE, -16, 1)
     except Exception:
         pass
     pygame.init()
-    # SCALED: SDL масштабирует кадр под окно/холст С СОХРАНЕНИЕМ ПРОПОРЦИЙ
-    # (в браузере pygbag это убирает вертикальное растяжение гексов).
+    # SCALED — масштабирование под холст браузера С СОХРАНЕНИЕМ ПРОПОРЦИЙ.
     try:
         surf = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.SCALED)
     except Exception:
         surf = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-    pygame.display.set_caption("Filler_hex")
-    init_sound()
-    font = load_font(18)
-    big  = load_font(30)
+    pygame.display.set_caption("SPHERIX")
     clock = pygame.time.Clock()
+    font  = load_font(16)
+    big   = load_font(30)
+    init_sprites()
+    init_sound()
 
-    # Внешний цикл — стартовый экран (выбор игроков). В браузере (emscripten)
-    # вкладку/страницу не перезагружаем ради повтора — это заново показывает
-    # экран pygbag "click/touch page". Поэтому на вебе выход из партии/меню
-    # возвращает в меню, а не завершает программу.
+    # Загружаем таблицу рекордов (файл создаётся при отсутствии). До игры её
+    # НЕ показываем — таблица выводится только после партии.
+    scores = load_scores()
+
+    # Внешний цикл: перед КАЖДОЙ партией спрашиваем начальный уровень заново.
+    # В браузере (emscripten) вкладку/страницу не перезагружаем ради повтора —
+    # это заново показывает экран pygbag "click/touch page". Поэтому на вебе
+    # выход из партии/меню возвращает в меню, а не завершает программу.
     is_web = sys.platform == "emscripten"
 
-    quit_all = False
-    while not quit_all:
-        settings = await start_screen(surf, font, big)
-        if settings is None:                  # Esc на стартовом экране — выход
+    while True:
+        level = await choose_level(surf, font, big)
+        if level is None:                 # Esc/закрытие в меню — выход
             if is_web:
                 await web_stopped(surf, big)
                 continue
             break
-        while True:                           # серия партий с этими настройками
-            game = Game()
-            game.settings = settings
-            result = await run_game(game, surf, font, clock)
-            if result == 'quit':
-                break                         # Esc в партии — назад к старт-экрану
-            if result == 'draw':
-                await show_draw(game, surf, font, big, clock)     # ничья
-            else:
-                await wave_fill(game, surf, font, result, clock)  # победная заливка
-            if not await ask_again(surf, font):
-                if is_web:
-                    await web_stopped(surf, big)
-                    break                      # N — назад к старт-экрану (не выход)
-                quit_all = True               # N — выход из программы
-                break
 
-    await goodbye(surf, big)                  # финальный экран, новую игру не начинаем
+        game, result = await run_game(level, surf, font, clock)
+        if result == 'quit':              # Esc в партии — выход
+            if is_web:
+                await web_stopped(surf, big)
+                continue
+            break
+
+        # Проверка нового рекорда: если счёт выше последнего в топ-10.
+        if int(game.score) > (scores[-1]["score"] if scores else 0):
+            name = await enter_initials(surf, font)
+            scores = insert_score(scores, name, game.lines, int(game.score))
+            save_scores(scores)
+
+        # Показываем обновлённую таблицу и спрашиваем о повторе.
+        await show_scores(surf, font, big, scores)
+        if not await ask_again(surf, font):   # «N» — выход
+            if is_web:
+                await web_stopped(surf, big)
+                continue
+            break
+
+    await goodbye(surf, big)              # финальный экран, новую игру не начинаем
     pygame.quit()
-
 
 if __name__ == "__main__":
     asyncio.run(main())

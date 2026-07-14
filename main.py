@@ -1309,6 +1309,8 @@ async def choose_level(surf, font, big):
         k = ev.key
         if pygame.K_0 <= k <= pygame.K_9:
             return k - pygame.K_0   # цифра нажата → запускаем сразу
+        if pygame.K_KP0 <= k <= pygame.K_KP9:
+            return k - pygame.K_KP0   # цифра на цифровой панели
         if k == pygame.K_ESCAPE:
             return None
 
@@ -1472,16 +1474,21 @@ async def goodbye(surf, big):
 
 async def web_stopped(surf, big):
     """На вебе N/Esc не завершают программу (страницу не перезагрузить без
-    потери разрешения на звук) — но должна быть чёткая точка «остановки»,
-    а не мгновенный проброс обратно в меню. Показываем финальное сообщение
-    и ждём любую клавишу, чтобы вернуться в меню."""
+    потери разрешения на звук) — но должна быть чёткая точка «остановки»:
+    показываем прощальный экран и уводим на главную страницу сайта, а не
+    начинаем новую партию."""
     surf.fill(BLACK)
     msg = big.render("Thanks for playing !", True, YELLOW)
     surf.blit(msg, ((SCREEN_W - msg.get_width()) // 2, SCREEN_H // 2 - 30))
-    hint = load_font(18).render("Press any key to play again", True, LGRAY)
-    surf.blit(hint, ((SCREEN_W - hint.get_width()) // 2, SCREEN_H // 2 + 24))
     pygame.display.flip()
-    await wait_key()
+    try:
+        import platform
+        platform.window.location.href = "https://i-skudarnov.github.io/"
+    except Exception:
+        pass
+    while True:                  # удерживаем экран на случай задержки редиректа
+        pygame.event.get()      # вычитываем события, чтобы вкладка не «висла»
+        await asyncio.sleep(0.1)
 
 
 async def main():

@@ -27,7 +27,7 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pygame
+          pip install pyinstaller pygame pillow
 
       # Та же команда, что и в make_EXE.bat.
       - name: Build EXE

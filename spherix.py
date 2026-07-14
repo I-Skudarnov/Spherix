@@ -1397,6 +1397,8 @@ def choose_level(surf, font, big):
         k = ev.key
         if pygame.K_0 <= k <= pygame.K_9:
             return k - pygame.K_0   # цифра нажата → запускаем сразу
+        if pygame.K_KP0 <= k <= pygame.K_KP9:
+            return k - pygame.K_KP0   # цифра на цифровой панели
         if k == pygame.K_ESCAPE:
             return None
 

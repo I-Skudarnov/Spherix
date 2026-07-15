@@ -1377,6 +1377,16 @@ def show_scores(surf, font, big, scores):
     pygame.event.clear()   # сбрасываем «старые» события, чтобы реагировать сразу
     wait_key()
 
+# Сканкоды цифровой панели (не зависят от NumLock, в отличие от event.key,
+# который при выключенном NumLock превращается в Home/End/Insert и т.п.).
+_KP_SCANCODE_DIGIT = {
+    pygame.KSCAN_KP0: 0, pygame.KSCAN_KP1: 1, pygame.KSCAN_KP2: 2,
+    pygame.KSCAN_KP3: 3, pygame.KSCAN_KP4: 4, pygame.KSCAN_KP5: 5,
+    pygame.KSCAN_KP6: 6, pygame.KSCAN_KP7: 7, pygame.KSCAN_KP8: 8,
+    pygame.KSCAN_KP9: 9,
+}
+
+
 def choose_level(surf, font, big):
     """Выбрать уровень 0-9. Нажатие цифры сразу запускает игру.
 
@@ -1398,7 +1408,9 @@ def choose_level(surf, font, big):
         if pygame.K_0 <= k <= pygame.K_9:
             return k - pygame.K_0   # цифра нажата → запускаем сразу
         if pygame.K_KP0 <= k <= pygame.K_KP9:
-            return k - pygame.K_KP0   # цифра на цифровой панели
+            return k - pygame.K_KP0   # цифра на цифровой панели (NumLock включён)
+        if ev.scancode in _KP_SCANCODE_DIGIT:
+            return _KP_SCANCODE_DIGIT[ev.scancode]   # цифровая панель, NumLock выключён
         if k == pygame.K_ESCAPE:
             return None
 
